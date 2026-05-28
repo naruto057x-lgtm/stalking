@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 import discord
 from discord.ext import commands, tasks
 import aiohttp
@@ -1203,7 +1204,7 @@ async def roblox_radar_loop():
                     
                     # تحديث ومزامنة خط الأساس بالكامل لمنع أي تكرار
                     friends_data["baseline_ids"] = current_ids
-                    save_json(FRIENDS_FILE, friends_data)
+                    save_friends_data(friends_data)
 
         except Exception as e:
             print(f"Error in main background radar: {e}")
