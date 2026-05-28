@@ -14,11 +14,12 @@ WEBHOOK_URL = "https://discord.com/api/webhooks/1509381394382716998/PXxpSyW764UG
 SAVE_PATH = "./stories_downloads"
 CACHE_FILE = "seen_stories.txt"
 
-# البروكسي المصري لتجاوز القيود على Instagram
-PROXY = {
-    "http": "http://217.52.247.73:1981",
-    "https": "http://217.52.247.73:1981"
-}
+# البروكسي لـ Railway (لتجاوز قيود Instagram Data Center)
+PROXY_HOST = "38.154.203.95"
+PROXY_PORT = 5863
+PROXY_USERNAME = "qgoaekkf"
+PROXY_PASSWORD = "soewt68civrr"
+PROXY_URL = f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
 
 BOT_TOKEN = "MTUwOTM3MDgyMzExNzUwODYyOA.Gcu40Y.GjypUteQXyVwe55l_Fgg0NCyD9P_eWQid4OzOY"
 COMMANDS_CHANNEL_ID = 1509381347012120617
@@ -47,55 +48,44 @@ def save_seen_story(story_id):
 seen_stories_cache = load_seen_stories()
 current_cached_username = None 
 
-cl = Client(proxy=PROXY)
-print("🔄 جاري تسجيل الدخول إلى إنستاجرام باستخدام الـ Session ID مع البروكسي المصري...")
+# إنشاء Client مع البروكسي
+proxy_dict = {
+    "http": PROXY_URL,
+    "https": PROXY_URL,
+}
+
+cl = Client(proxies=proxy_dict)
+print("🔄 جاري تسجيل الدخول إلى إنستاجرام باستخدام البروكسي...")
+print(f"🌍 البروكسي المستخدم: {PROXY_HOST}:{PROXY_PORT} (🇺🇸 United States - Piscataway)")
 try:
     cl.login_by_sessionid(SESSION_ID)
     print(f"✅ تم تسجيل الدخول بنجاح عبر البروكسي! الذاكرة محملة بـ {len(seen_stories_cache)} ستوري سابقة.")
 except Exception as e:
-    print(f"❌ فشل تسجيل الدخول: {e}")
-    print(f"⚠️ جاري إعادة المحاولة بدون البروكسي...")
+    print(f"❌ فشل تسجيل الدخول عبر البروكسي: {e}")
+    print(f"⚠️ محاولة بدون بروكسي...")
     try:
         cl = Client()
         cl.login_by_sessionid(SESSION_ID)
         print(f"✅ تم تسجيل الدخول بنجاح (بدون بروكسي)! الذاكرة محملة بـ {len(seen_stories_cache)} ستوري سابقة.")
     except Exception as e2:
-        print(f"❌ فشل تسجيل الدخول نهائياً: {e2}")
+        print(f"❌ فشل تسجيل الدخول أيضاً بدون بروكسي: {e2}")
+        print(f"⚠️ تأكد من صحة SESSION_ID أو أن حسابك لم يُحظر")
         exit()
 
 def send_to_discord_webhook(text, file_path=None):
     payload = {"content": text}
-    try:
-        if file_path and os.path.exists(file_path):
-            file_size = os.path.getsize(file_path) / (1024 * 1024)
-            if file_size <= 10: 
-                with open(file_path, "rb") as f:
-                    files = {"file": (os.path.basename(file_path), f)}
-                    res = requests.post(WEBHOOK_URL, data=payload, files=files, proxies=PROXY, timeout=30)
-            else:
-                payload["content"] += f"\n⚠️ **تنبيه:** حجم الستوري كبير ({file_size:.2f} MB)، تم حفظ الملف محلياً في الفولدر!"
-                res = requests.post(WEBHOOK_URL, json=payload, proxies=PROXY, timeout=30)
+    if file_path and os.path.exists(file_path):
+        file_size = os.path.getsize(file_path) / (1024 * 1024)
+        if file_size <= 10: 
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f)}
+                res = requests.post(WEBHOOK_URL, data=payload, files=files)
         else:
-            res = requests.post(WEBHOOK_URL, json=payload, proxies=PROXY, timeout=30)
-        return res.status_code
-    except Exception as e:
-        print(f"⚠️ خطأ في إرسال الـ Webhook: {e}")
-        # محاولة بدون بروكسي
-        try:
-            if file_path and os.path.exists(file_path):
-                file_size = os.path.getsize(file_path) / (1024 * 1024)
-                if file_size <= 10: 
-                    with open(file_path, "rb") as f:
-                        files = {"file": (os.path.basename(file_path), f)}
-                        res = requests.post(WEBHOOK_URL, data=payload, files=files, timeout=30)
-                else:
-                    res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-            else:
-                res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-            return res.status_code
-        except Exception as e2:
-            print(f"❌ فشل الإرسال نهائياً: {e2}")
-            return 0
+            payload["content"] += f"\n⚠️ **تنبيه:** حجم الستوري كبير ({file_size:.2f} MB)، تم حفظ الملف محلياً في الفولدر!"
+            res = requests.post(WEBHOOK_URL, json=payload)
+    else:
+        res = requests.post(WEBHOOK_URL, json=payload)
+    return res.status_code
 
 def get_time_ago(post_time):
     now = datetime.now(timezone.utc)
