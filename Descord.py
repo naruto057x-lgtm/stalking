@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timezone
 
 # ==================== الإعدادات الأساسية ====================
-BOT_TOKEN = "MTUwOTM3MDgyMzExNzUwODYyOA.Gnnk5d.ja7miRoobZd-39AgB9dJ3Ad5-_app0Me_NB0q0"  
+BOT_TOKEN = "MTUwOTM3MDgyMzExNzUwODYyOA.Gcu40Y.GjypUteQXyVwe55l_Fgg0NCyD9P_eWQid4OzOY"  
 TARGET_USER_ID = "1332799976077656105"    
 WEBHOOK_URL = "https://discord.com/api/webhooks/1509353177663803522/OMdWhlsdCCU0rlTrVs-pWGt0Vhqnb81PYrJ9Q0IEOlhjs0ackASANAB59YOwfEuU-Bg7"
 # ============================================================
