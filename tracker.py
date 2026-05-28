@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import Descord
-import instagram
 import discord
 from discord.ext import commands, tasks
 import aiohttp
