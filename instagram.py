@@ -14,7 +14,7 @@ WEBHOOK_URL = "https://discord.com/api/webhooks/1509381394382716998/PXxpSyW764UG
 SAVE_PATH = "./stories_downloads"
 CACHE_FILE = "seen_stories.txt"
 
-BOT_TOKEN = "MTUwOTM3MDgyMzExNzUwODYyOA.Gcu40Y.GjypUteQXyVwe55l_Fgg0NCyD9P_eWQid4OzOY"
+BOT_TOKEN = "MTUwOTU0OTE2NDc1NTY4MTQzMg.GrHDLg.Zkeis6jBP-c4u2esNkwlBWFjhOrelqXuHPmsnU"
 COMMANDS_CHANNEL_ID = 1509381347012120617
 
 # Instagram Bot Setup
