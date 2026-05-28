@@ -1,4 +1,5 @@
-discord.py
-aiohttp
-motor
-dnspython
+discord.py==2.4.0
+aiohttp==3.9.3
+pymongo==4.6.1
+requests==2.31.0
+instagrapi==2.0.0
