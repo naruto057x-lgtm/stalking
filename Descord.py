@@ -1,12 +1,19 @@
 import requests
 import time
+import discord
+from discord.ext import commands, tasks
 from datetime import datetime, timezone
 
 # ==================== الإعدادات الأساسية ====================
 BOT_TOKEN = "MTUwOTM3MDgyMzExNzUwODYyOA.Gcu40Y.GjypUteQXyVwe55l_Fgg0NCyD9P_eWQid4OzOY"  
 TARGET_USER_ID = "1332799976077656105"    
 WEBHOOK_URL = "https://discord.com/api/webhooks/1509353177663803522/OMdWhlsdCCU0rlTrVs-pWGt0Vhqnb81PYrJ9Q0IEOlhjs0ackASANAB59YOwfEuU-Bg7"
+COMMANDS_CHANNEL_ID = 1509464730509643846
 # ============================================================
+
+intents = discord.Intents.default()
+intents.message_content = True
+discord_bot = commands.Bot(command_prefix="!", intents=intents)
 
 headers = {
     "Authorization": f"Bot {BOT_TOKEN}",
@@ -196,5 +203,84 @@ def start_radar():
             print("🔥 تم رصد تحديثات جديدة! جاري إرسال التنبيه الفوري...")
             send_to_webhook(current_data, TARGET_USER_ID, changes_made=changes_string)
 
-if __name__ == "__main__":
+@discord_bot.event
+async def on_ready():
+    print(f"\n{'='*70}")
+    print(f"🤖 Discord Monitor Bot Ready as: {discord_bot.user.name}")
+    print(f"{'='*70}\n")
+    radar_monitor_loop.start()
+
+@discord_bot.command(name="commands")
+async def cmd_commands(ctx):
+    """عرض جميع أوامر رادار ديسكورد"""
+    if ctx.channel.id != COMMANDS_CHANNEL_ID:
+        return
+    
+    embed = discord.Embed(title="📖 قائمة أوامر رادار ديسكورد (Discord Monitor Commands)", color=0x7289DA)
+    
+    embed.add_field(
+        name="👤 !profile",
+        value="عرض بيانات البروفايل الحالية للحساب المراقب\n**مثال:** `!profile`",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔔 التنبيهات التلقائية",
+        value="**النظام يرسل إشعارات تلقائية متى:**\n"
+              "📝 **تعديل البايو** - إشعار فوري\n"
+              "🖼️ **تغيير صورة البروفايل** - إشعار فوري مع الصورة الجديدة\n"
+              "🌌 **تغيير صورة البانر** - إشعار فوري\n"
+              "👤 **تغيير الاسم المستعار** - إشعار فوري\n"
+              "🛡️ **الدخول/الخروج من Clan** - إشعار فوري\n"
+              "✨ **تغيير زينة الأفاتار** - إشعار فوري",
+        inline=False
+    )
+    
+    embed.set_footer(text="الرادار يفحص البروفايل كل دقيقة تلقائياً 🔍")
+    await ctx.send(embed=embed)
+
+@discord_bot.command(name="profile")
+async def cmd_profile(ctx):
+    """عرض بيانات البروفايل الحالية"""
+    if ctx.channel.id != COMMANDS_CHANNEL_ID:
+        return
+    
+    user_data = get_discord_user_data(TARGET_USER_ID)
+    if user_data:
+        await ctx.send("📊 جاري جلب بيانات البروفايل الحالية...")
+        # استخدام الدالة الموجودة بالفعل لإرسال البيانات
+        send_to_webhook(user_data, TARGET_USER_ID)
+        await ctx.send("✅ تم إرسال بيانات البروفايل إلى الـ Webhook!")
+    else:
+        await ctx.send("❌ تعذر جلب بيانات البروفايل!")
+
+async def radar_monitor_loop_task():
+    """حلقة المراقبة المستمرة في الخلفية"""
+    await discord_bot.wait_until_ready()
     start_radar()
+
+def main():
+    """تشغيل البوت"""
+    import asyncio
+    # تشغيل حلقة المراقبة في الخلفية
+    asyncio.create_task(radar_monitor_loop_task())
+    discord_bot.run(BOT_TOKEN)
+
+@tasks.loop(minutes=1)
+async def radar_monitor_loop():
+    """مراقبة محدثة كل دقيقة"""
+    pass
+
+if __name__ == "__main__":
+    print("🚀 إطلاق نظام مراقبة ديسكورد المتقدم...")
+    
+    # تشغيل البوت والرادار معاً
+    import asyncio
+    import threading
+    
+    # تشغيل الرادار في خيط منفصل
+    radar_thread = threading.Thread(target=start_radar, daemon=True)
+    radar_thread.start()
+    
+    # تشغيل البوت الرئيسي
+    discord_bot.run(BOT_TOKEN)
