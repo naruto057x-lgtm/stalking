@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from instagrapi import Client
 
 # ==================== الإعدادات الأساسية ====================
-SESSION_ID = "28227353802%3AkoKSWQ93I1lXwG%3A11%3AAYgM_1krietG8JcIiEn1Rzy1PqLNJ4sSyJBgNMnYB_c"  
+SESSION_ID = "28227353802%3A4SeUP8Q6ltIZqy%3A1%3AAYhA5aI0tXVvvlH1GkKlYBqTev5rJ56SY6WW5uL0xg"  
 TARGET_USER_ID = "62464376993"       
 WEBHOOK_URL = "https://discord.com/api/webhooks/1509381394382716998/PXxpSyW764UGoxYYtlxZQTZEWotQZd71hn3lcueGwETLs8OPUXX_KMYNhXgwieN1fHeo"
 SAVE_PATH = "./stories_downloads"
