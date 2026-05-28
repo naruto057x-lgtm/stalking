@@ -8,13 +8,19 @@ from datetime import datetime, timezone
 from instagrapi import Client
 
 # ==================== الإعدادات الأساسية ====================
-SESSION_ID = "28227353802%3A4SeUP8Q6ltIZqy%3A1%3AAYhA5aI0tXVvvlH1GkKlYBqTev5rJ56SY6WW5uL0xg"  
+SESSION_ID = "28227353802%3AkoKSWQ93I1lXwG%3A11%3AAYgM_1krietG8JcIiEn1Rzy1PqLNJ4sSyJBgNMnYB_c"  
 TARGET_USER_ID = "62464376993"       
 WEBHOOK_URL = "https://discord.com/api/webhooks/1509381394382716998/PXxpSyW764UGoxYYtlxZQTZEWotQZd71hn3lcueGwETLs8OPUXX_KMYNhXgwieN1fHeo"
 SAVE_PATH = "./stories_downloads"
 CACHE_FILE = "seen_stories.txt"
 
-BOT_TOKEN = "MTUwOTU0OTE2NDc1NTY4MTQzMg.GrHDLg.Zkeis6jBP-c4u2esNkwlBWFjhOrelqXuHPmsnU"
+# البروكسي المصري لتجاوز القيود على Instagram
+PROXY = {
+    "http": "http://217.52.247.73:1981",
+    "https": "http://217.52.247.73:1981"
+}
+
+BOT_TOKEN = "MTUwOTM3MDgyMzExNzUwODYyOA.Gcu40Y.GjypUteQXyVwe55l_Fgg0NCyD9P_eWQid4OzOY"
 COMMANDS_CHANNEL_ID = 1509381347012120617
 
 # Instagram Bot Setup
@@ -41,29 +47,55 @@ def save_seen_story(story_id):
 seen_stories_cache = load_seen_stories()
 current_cached_username = None 
 
-cl = Client()
-print("🔄 جاري تسجيل الدخول إلى إنستاجرام باستخدام الـ Session ID...")
+cl = Client(proxy=PROXY)
+print("🔄 جاري تسجيل الدخول إلى إنستاجرام باستخدام الـ Session ID مع البروكسي المصري...")
 try:
     cl.login_by_sessionid(SESSION_ID)
-    print(f"✅ تم تسجيل الدخول بنجاح! الذاكرة محملة بـ {len(seen_stories_cache)} ستوري سابقة.")
+    print(f"✅ تم تسجيل الدخول بنجاح عبر البروكسي! الذاكرة محملة بـ {len(seen_stories_cache)} ستوري سابقة.")
 except Exception as e:
-    print(f"❌ فشل تسجيل الدخول، تأكد من الـ Session ID: {e}")
-    exit()
+    print(f"❌ فشل تسجيل الدخول: {e}")
+    print(f"⚠️ جاري إعادة المحاولة بدون البروكسي...")
+    try:
+        cl = Client()
+        cl.login_by_sessionid(SESSION_ID)
+        print(f"✅ تم تسجيل الدخول بنجاح (بدون بروكسي)! الذاكرة محملة بـ {len(seen_stories_cache)} ستوري سابقة.")
+    except Exception as e2:
+        print(f"❌ فشل تسجيل الدخول نهائياً: {e2}")
+        exit()
 
 def send_to_discord_webhook(text, file_path=None):
     payload = {"content": text}
-    if file_path and os.path.exists(file_path):
-        file_size = os.path.getsize(file_path) / (1024 * 1024)
-        if file_size <= 10: 
-            with open(file_path, "rb") as f:
-                files = {"file": (os.path.basename(file_path), f)}
-                res = requests.post(WEBHOOK_URL, data=payload, files=files)
+    try:
+        if file_path and os.path.exists(file_path):
+            file_size = os.path.getsize(file_path) / (1024 * 1024)
+            if file_size <= 10: 
+                with open(file_path, "rb") as f:
+                    files = {"file": (os.path.basename(file_path), f)}
+                    res = requests.post(WEBHOOK_URL, data=payload, files=files, proxies=PROXY, timeout=30)
+            else:
+                payload["content"] += f"\n⚠️ **تنبيه:** حجم الستوري كبير ({file_size:.2f} MB)، تم حفظ الملف محلياً في الفولدر!"
+                res = requests.post(WEBHOOK_URL, json=payload, proxies=PROXY, timeout=30)
         else:
-            payload["content"] += f"\n⚠️ **تنبيه:** حجم الستوري كبير ({file_size:.2f} MB)، تم حفظ الملف محلياً في الفولدر!"
-            res = requests.post(WEBHOOK_URL, json=payload)
-    else:
-        res = requests.post(WEBHOOK_URL, json=payload)
-    return res.status_code
+            res = requests.post(WEBHOOK_URL, json=payload, proxies=PROXY, timeout=30)
+        return res.status_code
+    except Exception as e:
+        print(f"⚠️ خطأ في إرسال الـ Webhook: {e}")
+        # محاولة بدون بروكسي
+        try:
+            if file_path and os.path.exists(file_path):
+                file_size = os.path.getsize(file_path) / (1024 * 1024)
+                if file_size <= 10: 
+                    with open(file_path, "rb") as f:
+                        files = {"file": (os.path.basename(file_path), f)}
+                        res = requests.post(WEBHOOK_URL, data=payload, files=files, timeout=30)
+                else:
+                    res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+            else:
+                res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+            return res.status_code
+        except Exception as e2:
+            print(f"❌ فشل الإرسال نهائياً: {e2}")
+            return 0
 
 def get_time_ago(post_time):
     now = datetime.now(timezone.utc)
@@ -313,7 +345,7 @@ async def cmd_send(ctx):
     if ctx.channel.id != COMMANDS_CHANNEL_ID:
         return
     
-    await ctx.send("📤 جاري إرسال الستوريات المتاحة حالياً (بغض النظر عن حالة الإرسال السابقة)...")
+    await ctx.send("📤 جاري إرسال الستوريات الجديدة...")
     try:
         user_info = cl.user_info(TARGET_USER_ID)
         stories = cl.user_stories(TARGET_USER_ID)
@@ -322,16 +354,36 @@ async def cmd_send(ctx):
             await ctx.send("📭 لا توجد ستوريات للإرسال حالياً!")
             return
         
+        # قائمة بالستوريات التي سيتم إرسالها (الجديدة أو التي لم تُرسل بنجاح من قبل)
+        stories_to_process = []
+        for story in stories:
+            if story.id not in seen_stories_cache:
+                stories_to_process.append(story)
+        
+        if not stories_to_process:
+            await ctx.send("✅ جميع الستوريات المتاحة حالياً قد تم إرسالها بنجاح مسبقاً! لا توجد ستوريات جديدة لإرسالها.")
+            return
+        
         embed_start = discord.Embed(
-            title=f"📤 إرسال {len(stories)} ستوري",
-            description=f"🎬 جاري إرسال جميع الستوريات المتاحة من @{user_info.username}...",
+            title=f"📤 إرسال {len(stories_to_process)} ستوريات جديدة",
+            description=f"🎬 جاري إرسال {len(stories_to_process)} ستوري من @{user_info.username}...",
             color=0x2ECC71
         )
         await ctx.send(embed=embed_start)
         
         sent_count = 0
+        skipped_count = 0
         
         for index, story in enumerate(stories, 1):
+            if story.id in seen_stories_cache:
+                skipped_count += 1
+                embed_skipped = discord.Embed(
+                    description=f"ℹ️ الستوري {index} (ID: `{story.id}`) مرسلة بالفعل. تم التخطي.",
+                    color=0xF1C40F
+                )
+                await ctx.send(embed=embed_skipped)
+                continue
+                
             try:
                 # تحميل الستوري
                 file_path = cl.story_download(story.id, folder=SAVE_PATH)
@@ -347,27 +399,21 @@ async def cmd_send(ctx):
                 
                 time_ago = get_time_ago(story.taken_at)
                 
-                # رسالة توضيحية إذا كانت الستوري قد أُرسلت من قبل
-                status_note = "" 
-                if story.id in seen_stories_cache:
-                    status_note = " (أُرسلت مسبقاً في فحص سابق)"
-
-                msg = f"📸 **ستوري رقم {index} من {len(stories)}**{status_note}\n👤 @{user_info.username}\n⏳ {time_ago}"
+                msg = f"📸 **ستوري رقم {index} من {len(stories_to_process) + skipped_count}**\n👤 @{user_info.username}\n⏳ {time_ago}"
                 
                 status = send_to_discord_webhook(msg, file_path=new_file_path)
                 if status in [200, 204]:
-                    # لا يزال يتم حفظها في الكاش لكي لا يرسلها الرادار التلقائي مرة أخرى
                     seen_stories_cache.add(story.id)
                     save_seen_story(story.id)
                     sent_count += 1
                     embed_success = discord.Embed(
-                        description=f"✅ تم إرسال الستوري **{index}/{len(stories)}** بنجاح",
+                        description=f"✅ تم إرسال الستوري **{index}/{len(stories_to_process) + skipped_count}** بنجاح",
                         color=0x2ECC71
                     )
                     await ctx.send(embed=embed_success)
                 else:
                     embed_error = discord.Embed(
-                        description=f"❌ فشل إرسال الستوري {index}/{len(stories)}",
+                        description=f"❌ فشل إرسال الستوري {index}/{len(stories_to_process) + skipped_count}",
                         color=0xFF6B6B
                     )
                     await ctx.send(embed=embed_error)
@@ -376,7 +422,7 @@ async def cmd_send(ctx):
         
         embed_done = discord.Embed(
             title="✅ تم إنهاء الإرسال",
-            description=f"تم إرسال **{sent_count}** ستوريات (تضمنت بعض الستوريات المعاد إرسالها بناءً على طلبك).",
+            description=f"تم إرسال **{sent_count}** ستوريات جديدة.\nتم تخطي **{skipped_count}** ستوري مرسلة مسبقاً.",
             color=0x2ECC71
         )
         await ctx.send(embed=embed_done)
