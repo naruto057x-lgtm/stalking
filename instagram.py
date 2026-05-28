@@ -49,15 +49,12 @@ seen_stories_cache = load_seen_stories()
 current_cached_username = None 
 
 # إنشاء Client مع البروكسي
-proxy_dict = {
-    "http": PROXY_URL,
-    "https": PROXY_URL,
-}
-
-cl = Client(proxies=proxy_dict)
+cl = Client()
 print("🔄 جاري تسجيل الدخول إلى إنستاجرام باستخدام البروكسي...")
 print(f"🌍 البروكسي المستخدم: {PROXY_HOST}:{PROXY_PORT} (🇺🇸 United States - Piscataway)")
 try:
+    # تعيين البروكسي باستخدام الطريقة الصحيحة
+    cl.set_proxy(PROXY_URL)
     cl.login_by_sessionid(SESSION_ID)
     print(f"✅ تم تسجيل الدخول بنجاح عبر البروكسي! الذاكرة محملة بـ {len(seen_stories_cache)} ستوري سابقة.")
 except Exception as e:
