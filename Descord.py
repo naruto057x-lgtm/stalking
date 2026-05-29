@@ -93,6 +93,7 @@ def send_to_webhook(user_data, user_id, changes_made=None):
         deco_status = "*الشخص مش حاطط أي ديكوريشن على الأفاتار*"
 
     fields = [
+        {"name": "👤 Username:", "value": f"`{username}`", "inline": True},
         {"name": "Name (Global Name):", "value": global_name, "inline": True},
         {"name": "🆔 User ID:", "value": f"`{user_id}`", "inline": True},
         {"name": "📅 تاريخ إنشاء الحساب:", "value": f"`{creation_date}`", "inline": False},
@@ -161,40 +162,59 @@ def start_radar():
         detected_changes = []
 
         # 1. قنص تغيير اليوزرنيم
-        if current_data.get("username") != profile_cache["username"]:
-            detected_changes.append(f"🔹 **تغيير اليوزرنيم:** من `{profile_cache['username']}` إلى `{current_data.get('username')}`")
-            profile_cache["username"] = current_data.get("username")
+        current_username = current_data.get("username")
+        print(f"[DEBUG] Username: {current_username} vs {profile_cache['username']}")
+        if current_username != profile_cache["username"]:
+            detected_changes.append(f"🔹 **تغيير اليوزرنيم:** من `{profile_cache['username']}` إلى `{current_username}`")
+            print(f"✅ تم رصد تغيير في Username")
+            profile_cache["username"] = current_username
 
         # 2. قنص تغيير الـ Global Name
-        if current_data.get("global_name") != profile_cache["global_name"]:
-            detected_changes.append(f"🔹 **تغيير الاسم المستعار:** من `{profile_cache['global_name']}` إلى `{current_data.get('global_name')}`")
-            profile_cache["global_name"] = current_data.get("global_name")
+        current_global_name = current_data.get("global_name")
+        print(f"[DEBUG] Global Name: {current_global_name} vs {profile_cache['global_name']}")
+        if current_global_name != profile_cache["global_name"]:
+            detected_changes.append(f"🔹 **تغيير الاسم المستعار:** من `{profile_cache['global_name']}` إلى `{current_global_name}`")
+            print(f"✅ تم رصد تغيير في Global Name")
+            profile_cache["global_name"] = current_global_name
 
         # 3. قنص تغيير البايو كاملاً
-        if current_data.get("bio") != profile_cache["bio"]:
+        current_bio = current_data.get("bio")
+        print(f"[DEBUG] Bio: {current_bio} vs {profile_cache['bio']}")
+        if current_bio != profile_cache["bio"]:
             detected_changes.append("📝 **قام بتعديل البايو (Bio) الخاص ببروفايله الحساب!**")
-            profile_cache["bio"] = current_data.get("bio")
+            print(f"✅ تم رصد تغيير في Bio")
+            profile_cache["bio"] = current_bio
 
         # 4. قنص قفشة تغيير صورة البروفايل (الأفاتار)
-        if current_data.get("avatar") != profile_cache["avatar"]:
+        current_avatar = current_data.get("avatar")
+        print(f"[DEBUG] Avatar: {current_avatar} vs {profile_cache['avatar']}")
+        if current_avatar != profile_cache["avatar"]:
             detected_changes.append("🖼️ **قفشة! الشخص قام بتغيير صورة البروفايل (Avatar) الحالية!**")
-            profile_cache["avatar"] = current_data.get("avatar")
+            print(f"✅ تم رصد تغيير في Avatar")
+            profile_cache["avatar"] = current_avatar
 
         # 5. قنص تغيير البانر
-        if current_data.get("banner") != profile_cache["banner"]:
+        current_banner = current_data.get("banner")
+        print(f"[DEBUG] Banner: {current_banner} vs {profile_cache['banner']}")
+        if current_banner != profile_cache["banner"]:
             detected_changes.append("🌌 **تم رصد تغيير في صورة البانر (Banner) الخلفية!**")
-            profile_cache["banner"] = current_data.get("banner")
+            print(f"✅ تم رصد تغيير في Banner")
+            profile_cache["banner"] = current_banner
 
         # 6. قنص خروج أو دخول كلان (Guild Tag)
         current_clan_tag = current_data.get("clan", {}).get("tag") if current_data.get("clan") else None
+        print(f"[DEBUG] Clan Tag: {current_clan_tag} vs {profile_cache['clan_tag']}")
         if current_clan_tag != profile_cache["clan_tag"]:
             detected_changes.append(f"🛡️ **تعديل الـ Clan Tag:** من `{profile_cache['clan_tag']}` إلى `{current_clan_tag}`")
+            print(f"✅ تم رصد تغيير في Clan Tag")
             profile_cache["clan_tag"] = current_clan_tag
 
         # 7. قنص تغيير زينة الأفاتار (Decoration)
         current_deco = current_data.get("avatar_decoration_data", {}).get("asset") if current_data.get("avatar_decoration_data") else None
+        print(f"[DEBUG] Decoration: {current_deco} vs {profile_cache['avatar_decoration']}")
         if current_deco != profile_cache["avatar_decoration"]:
             detected_changes.append("✨ **قام بتغيير أو تحديث زينة الأفاتار (Avatar Decoration)!**")
+            print(f"✅ تم رصد تغيير في Decoration")
             profile_cache["avatar_decoration"] = current_deco
 
         # إذا لستة التغييرات فيها داتا، ابعت التنبيه فوراً
