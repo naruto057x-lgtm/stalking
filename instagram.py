@@ -14,16 +14,6 @@ WEBHOOK_URL = "https://discord.com/api/webhooks/1509381394382716998/PXxpSyW764UG
 SAVE_PATH = "./stories_downloads"
 CACHE_FILE = "seen_stories.txt"
 
-# البروكسي لـ Railway (لتجاوز قيود Instagram Data Center)
-PROXY_HOST = "38.154.203.95"
-PROXY_PORT = 5863
-PROXY_USERNAME = "qgoaekkf"
-PROXY_PASSWORD = "soewt68civrr"
-PROXY_URL = f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
-
-# User-Agent واقعي لتخديع Instagram
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
 BOT_TOKEN = "MTUwOTM3MDgyMzExNzUwODYyOA.Gcu40Y.GjypUteQXyVwe55l_Fgg0NCyD9P_eWQid4OzOY"
 COMMANDS_CHANNEL_ID = 1509381347012120617
 
@@ -51,29 +41,14 @@ def save_seen_story(story_id):
 seen_stories_cache = load_seen_stories()
 current_cached_username = None 
 
-# إنشاء Client مع البروكسي و User-Agent
 cl = Client()
-cl.set_user_agent(USER_AGENT)
-print("🔄 جاري تسجيل الدخول إلى إنستاجرام باستخدام البروكسي و User-Agent...")
-print(f"🌍 البروكسي المستخدم: {PROXY_HOST}:{PROXY_PORT} (🇺🇸 United States - Piscataway)")
-print(f"🔐 User-Agent: {USER_AGENT}")
+print("🔄 جاري تسجيل الدخول إلى إنستاجرام باستخدام الـ Session ID...")
 try:
-    # تعيين البروكسي باستخدام الطريقة الصحيحة
-    cl.set_proxy(PROXY_URL)
     cl.login_by_sessionid(SESSION_ID)
-    print(f"✅ تم تسجيل الدخول بنجاح عبر البروكسي! الذاكرة محملة بـ {len(seen_stories_cache)} ستوري سابقة.")
+    print(f"✅ تم تسجيل الدخول بنجاح! الذاكرة محملة بـ {len(seen_stories_cache)} ستوري سابقة.")
 except Exception as e:
-    print(f"❌ فشل تسجيل الدخول عبر البروكسي: {e}")
-    print(f"⚠️ محاولة بدون بروكسي...")
-    try:
-        cl = Client()
-        cl.set_user_agent(USER_AGENT)
-        cl.login_by_sessionid(SESSION_ID)
-        print(f"✅ تم تسجيل الدخول بنجاح (بدون بروكسي)! الذاكرة محملة بـ {len(seen_stories_cache)} ستوري سابقة.")
-    except Exception as e2:
-        print(f"❌ فشل تسجيل الدخول أيضاً بدون بروكسي: {e2}")
-        print(f"⚠️ تأكد من صحة SESSION_ID أو أن حسابك لم يُحظر")
-        exit()
+    print(f"❌ فشل تسجيل الدخول، تأكد من الـ Session ID: {e}")
+    exit()
 
 def send_to_discord_webhook(text, file_path=None):
     payload = {"content": text}
@@ -189,7 +164,7 @@ async def cmd_commands(ctx):
     embed = discord.Embed(title="📖 قائمة أوامر رادار إنستاجرام (Instagram Monitor Commands)", color=0xE1306C)
     
     embed.add_field(
-        name="� !check",
+        name="  !check",
         value="التحقق من وجود ستوريات جديدة وعدد الستوريات المتاحة\n**مثال:** `!check`",
         inline=False
     )
