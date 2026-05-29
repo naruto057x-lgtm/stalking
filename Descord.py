@@ -266,13 +266,82 @@ async def cmd_profile(ctx):
         return
     
     user_data = get_discord_user_data(TARGET_USER_ID)
-    if user_data:
-        await ctx.send("📊 جاري جلب بيانات البروفايل الحالية...")
-        # استخدام الدالة الموجودة بالفعل لإرسال البيانات
-        send_to_webhook(user_data, TARGET_USER_ID)
-        await ctx.send("✅ تم إرسال بيانات البروفايل إلى الـ Webhook!")
-    else:
+    if not user_data:
         await ctx.send("❌ تعذر جلب بيانات البروفايل!")
+        return
+    
+    # إنشاء نفس البيانات والـ embed مباشرة في هذه الروم دون الاعتماد على webhook
+    username = user_data.get("username", "Unknown")
+    global_name = user_data.get("global_name") or "لا يوجد اسم مستعار"
+    bio_text = user_data.get("bio") or "*هذا الشخص مش كاتب بايو في بروفايله*"
+    accent_color = user_data.get("accent_color") or 0x7289DA
+    
+    # حساب تاريخ إنشاء الحساب
+    try:
+        snowflake_id = int(TARGET_USER_ID)
+        timestamp = ((snowflake_id >> 22) + 1420070400000) / 1000
+        creation_date = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime('%Y-%m-%d %I:%M:%S %p UTC')
+    except:
+        creation_date = "غير قادر على الحساب"
+
+    # روابط البروفايل والبانر
+    avatar_hash = user_data.get("avatar")
+    if avatar_hash:
+        ext = "gif" if avatar_hash.startswith("a_") else "png"
+        avatar_url = f"https://cdn.discordapp.com/avatars/{TARGET_USER_ID}/{avatar_hash}.{ext}?size=1024"
+    else:
+        avatar_url = "https://cdn.discordapp.com/embed/avatars/0.png"
+
+    banner_hash = user_data.get("banner")
+    if banner_hash:
+        ext = "gif" if banner_hash.startswith("a_") else "png"
+        banner_url = f"https://cdn.discordapp.com/banners/{TARGET_USER_ID}/{banner_hash}.{ext}?size=1024"
+        banner_status = f"[اضغط هنا لفتح البانر]({banner_url})"
+    else:
+        banner_status = "*الشخص مش حاطط صورة بانر*"
+
+    # بيانات الـ Clan
+    clan_data = user_data.get("clan")
+    if clan_data:
+        clan_tag = clan_data.get("tag", "بدون تاغ")
+        clan_id = clan_data.get("identity_guild_id") or clan_data.get("guild_id") or "غير معروف"
+        clan_status = f"**₊ {clan_tag}**\n🆔 **ID:** `{clan_id}`"
+    else:
+        clan_status = "*الشخص ده مش مشترك في أي Clan حالياً*"
+
+    # بيانات الديكوريشن
+    deco_data = user_data.get("avatar_decoration_data")
+    if deco_data:
+        asset_hash = deco_data.get("asset")
+        deco_url = f"https://cdn.discordapp.com/avatar-decorations/{asset_hash}.png"
+        deco_status = f"[اضغط هنا لمعاينة الديكوريشن]({deco_url})"
+    else:
+        deco_status = "*الشخص مش حاطط أي ديكوريشن على الأفاتار*"
+
+    # إنشاء الـ Embed مباشرة في الروم
+    embed = discord.Embed(
+        title=f"👤 بيانات البروفايل الحالية: @{username}",
+        description="تفاصيل شاملة عن حساب الهدف",
+        color=accent_color,
+        timestamp=datetime.utcnow()
+    )
+    
+    embed.set_thumbnail(url=avatar_url)
+    if banner_hash:
+        embed.set_image(url=banner_url)
+    
+    embed.add_field(name="👤 Username", value=f"`{username}`", inline=True)
+    embed.add_field(name="Name (Global Name)", value=global_name, inline=True)
+    embed.add_field(name="🆔 User ID", value=f"`{TARGET_USER_ID}`", inline=True)
+    embed.add_field(name="📅 تاريخ إنشاء الحساب", value=f"`{creation_date}`", inline=False)
+    embed.add_field(name="🛡️ الـ Clan الحالي (Guild Tag)", value=clan_status, inline=False)
+    embed.add_field(name="✨ زينة الأفاتار (Decoration)", value=deco_status, inline=False)
+    embed.add_field(name="📝 البايو (Bio) بالكامل", value=bio_text, inline=False)
+    embed.add_field(name="🖼️ رابط صورة البانر", value=banner_status, inline=False)
+    
+    embed.set_footer(text="نظام الرادار الذكي المستمر • ديسكورد | تم الجلب الآن")
+    
+    await ctx.send(embed=embed)
 
 async def radar_monitor_loop_task():
     """حلقة المراقبة المستمرة في الخلفية"""
