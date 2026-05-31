@@ -1189,6 +1189,32 @@ async def cmd_status(ctx):
     embed.set_footer(text="يتم تحديث البيانات تلقائياً كل دقيقة")
     await ctx.send(embed=embed)
 
+
+@bot.command(name="what")
+async def cmd_what(ctx):
+    """عرض الوقت والتاريخ الحالي بتوقيت Europe/Lisbon"""
+    now = datetime.now(ZoneInfo("Europe/Lisbon"))
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+    tz_info = "Europe/Lisbon"
+    logical_day = get_active_report_date()
+    logical_state = state.get("logical_day_key")
+    last_act = state.get("last_activity_time")
+    if last_act:
+        last_act = _make_aware(last_act)
+        last_act_str = last_act.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        last_act_str = "لا توجد بيانات"
+
+    embed = discord.Embed(title="🕒 الوقت والتاريخ الحالي (كما يراه السكربت)", color=0x3498db)
+    embed.add_field(name="التاريخ الآن (Lisbon)", value=f"`{date_str}`", inline=True)
+    embed.add_field(name="الوقت الآن (Lisbon)", value=f"`{time_str}`", inline=True)
+    embed.add_field(name="اليوم المنطقي (get_active_report_date)", value=f"`{logical_day}`", inline=False)
+    embed.add_field(name="قيمة state['logical_day_key']", value=f"`{logical_state}`", inline=False)
+    embed.add_field(name="آخر نشاط مسجل (last_activity_time)", value=f"`{last_act_str}`", inline=False)
+    embed.set_footer(text=f"التوقيت المرجعي: {tz_info}")
+    await ctx.send(embed=embed)
+
 async def send_daily_summary(date_key):
     channel = bot.get_channel(DAILY_SUMMARY_CHANNEL_ID)
     if channel is None:
@@ -1684,6 +1710,44 @@ async def roblox_radar_loop():
                 save_state_data()
             except Exception as err:
                 print(f"Error saving state after loop: {err}")
+
+# أمر لعرض كل أوامر البوت بشكل منظم
+@bot.command(name="commands")
+async def cmd_commands(ctx):
+    """عرض كل أوامر البوت المتاحة وشرح مختصر لكل أمر"""
+    try:
+        groups = {}
+        for c in bot.commands:
+            if getattr(c, "hidden", False):
+                continue
+            cog = c.cog_name or "عام"
+            entry_name = f"!{c.name} {c.signature}".strip()
+            description = c.help or (getattr(c.callback, "__doc__", None) or "لا يوجد وصف متاح.")
+            description = description.strip() if isinstance(description, str) else str(description)
+            if cog not in groups:
+                groups[cog] = []
+            groups[cog].append((entry_name, description))
+
+        embeds = []
+        for cog_name in sorted(groups.keys()):
+            embed = discord.Embed(title=f"📚 أوامر - {cog_name}", color=0x1abc9c)
+            embed.set_footer(text="استخدم !<الأمر> للحصول على مزيد من التفاصيل إن وُجد")
+            count = 0
+            for entry_name, description in sorted(groups[cog_name], key=lambda x: x[0]):
+                embed.add_field(name=entry_name, value=(description[:1000] if description else "لا يوجد وصف."), inline=False)
+                count += 1
+                if count >= 20:
+                    embeds.append(embed)
+                    embed = discord.Embed(title=f"📚 أوامر - {cog_name} (متابعة)", color=0x1abc9c)
+                    embed.set_footer(text="متابعة")
+                    count = 0
+            embeds.append(embed)
+
+        for e in embeds:
+            await ctx.send(embed=e)
+    except Exception as e:
+        await ctx.send(f"حدث خطأ أثناء بناء قائمة الأوامر: {e}")
+
 
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
