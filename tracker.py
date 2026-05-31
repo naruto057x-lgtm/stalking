@@ -7,10 +7,19 @@ import aiohttp
 import json
 import os
 import sys
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
+
+# ==================== Timezone Helper ====================
+def _make_aware(dt):
+    """تحويل naive datetimes من MongoDB إلى aware datetimes في timezone Europe/Lisbon"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Europe/Lisbon"))
+    return dt
 
 # ==================== الإعدادات والروابط المباشرة ====================
 TARGET_USER_ID = 7620590660
@@ -21,6 +30,7 @@ CMD_CHANNEL_ID = 1509431098117984327
 ALERT_CHANNEL_ID = 1509345547197091940
 DAILY_SUMMARY_CHANNEL_ID = 1510270977513099296
 WEEKLY_SUMMARY_CHANNEL_ID = 1510275621316595802
+DETAIL_CHANNEL_ID = 1510541538445230080
 
 # ==================== MongoDB Configuration ====================
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://marwangamer056_db_user:NulNLKsdAz55Av50@cluster0.j35ail6.mongodb.net/?appName=Cluster0")
@@ -55,7 +65,8 @@ state = {
     "privacy_alert_sent": False,
     "last_activity_time": None,
     "session_day_start": None,
-    "offline_notification_sent": False
+    "offline_notification_sent": False,
+    "logical_day_key": None
 }
 
 headers = {
@@ -78,6 +89,7 @@ friends_collection = db.friends
 games_collection = db.games
 state_collection = db.state
 daily_stats_collection = db.daily_stats
+session_logs = db.session_logs
 
 # ==================== Database Helper Functions ====================
 def load_friends_data():
@@ -100,7 +112,7 @@ def save_friends_data(data):
             "baseline_ids": data.get("baseline_ids", []),
             "friends_details": data.get("friends_details", {}),
             "detected_new_friends": data.get("detected_new_friends", {}),
-            "last_updated": datetime.now()
+            "last_updated": datetime.now(ZoneInfo("Europe/Lisbon"))
         },
         upsert=True
     )
@@ -118,7 +130,7 @@ def load_games_stats():
 
 def save_games_stats(data):
     """حفظ إحصائيات الألعاب في MongoDB"""
-    doc = {"_id": "games_stats", "last_updated": datetime.now()}
+    doc = {"_id": "games_stats", "last_updated": datetime.now(ZoneInfo("Europe/Lisbon"))}
     doc.update(data)
     games_collection.replace_one({"_id": "games_stats"}, doc, upsert=True)
 
@@ -129,19 +141,20 @@ def load_state_data():
     if doc:
         return {
             "status": doc.get("status"),
-            "last_online_time": doc.get("last_online_time"),
-            "online_session_start": doc.get("online_session_start"),
-            "offline_since": doc.get("offline_since"),
+            "last_online_time": _make_aware(doc.get("last_online_time")),
+            "online_session_start": _make_aware(doc.get("online_session_start")),
+            "offline_since": _make_aware(doc.get("offline_since")),
             "offline_alert_sent": doc.get("offline_alert_sent", False),
             "pending_resume": doc.get("pending_resume", False),
             "pending_resume_place_id": doc.get("pending_resume_place_id"),
             "pending_resume_game_name": doc.get("pending_resume_game_name"),
-            "pending_resume_leave_time": doc.get("pending_resume_leave_time"),
+            "pending_resume_leave_time": _make_aware(doc.get("pending_resume_leave_time")),
             "last_avatar_url": doc.get("last_avatar_url"),
             "privacy_alert_sent": doc.get("privacy_alert_sent", False),
-            "last_activity_time": doc.get("last_activity_time"),
+            "last_activity_time": _make_aware(doc.get("last_activity_time")),
             "session_day_start": doc.get("session_day_start"),
-            "offline_notification_sent": doc.get("offline_notification_sent", False)
+            "offline_notification_sent": doc.get("offline_notification_sent", False),
+            "logical_day_key": doc.get("logical_day_key")
         }
     return {
         "status": None,
@@ -157,7 +170,8 @@ def load_state_data():
         "privacy_alert_sent": False,
         "last_activity_time": None,
         "session_day_start": None,
-        "offline_notification_sent": False
+        "offline_notification_sent": False,
+        "logical_day_key": None
     }
 
 
@@ -181,7 +195,8 @@ def save_state_data():
             "last_activity_time": state.get("last_activity_time"),
             "session_day_start": state.get("session_day_start"),
             "offline_notification_sent": state.get("offline_notification_sent", False),
-            "last_updated": datetime.now()
+            "logical_day_key": state.get("logical_day_key"),
+            "last_updated": datetime.now(ZoneInfo("Europe/Lisbon"))
         },
         upsert=True
     )
@@ -191,27 +206,92 @@ def get_date_str(dt):
     return dt.strftime("%Y-%m-%d")
 
 
+def sanitize_game_key(game_name):
+    if game_name is None:
+        return None
+    return str(game_name).replace('.', '_').replace('$', '_')
+
+
+def log_session_entry(game_name, place_id, start_time, end_time, date_key=None):
+    if not game_name or not place_id or not start_time or not end_time or end_time <= start_time:
+        return
+    session_logs.insert_one(
+        {
+            "game_name": game_name,
+            "place_id": str(place_id),
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration_seconds": int((end_time - start_time).total_seconds()),
+            "date_key": date_key or start_time.strftime("%Y-%m-%d")
+        }
+    )
+
+
 def split_duration_by_date(start_dt, end_dt):
     result = {}
     current = start_dt
     while current.date() < end_dt.date():
-        next_midnight = datetime.combine(current.date() + timedelta(days=1), datetime.min.time())
+        next_midnight = datetime.combine(current.date() + timedelta(days=1), datetime.min.time(), tzinfo=ZoneInfo("Europe/Lisbon"))
         result[get_date_str(current)] = int((next_midnight - current).total_seconds())
         current = next_midnight
     result[get_date_str(current)] = int((end_dt - current).total_seconds())
     return result
 
 
-def update_daily_online(start_dt, end_dt):
+def get_active_report_date():
+    if state.get("logical_day_key"):
+        return state["logical_day_key"]
+    now = datetime.now(ZoneInfo("Europe/Lisbon"))
+    if state.get("last_activity_time"):
+        last_activity = _make_aware(state.get("last_activity_time"))
+        if last_activity:
+            return get_date_str(last_activity)
+    return get_date_str(now)
+
+
+def get_logical_day_close_deadline(now=None):
+    if not state.get("logical_day_key"):
+        return None
+    now = now or datetime.now(ZoneInfo("Europe/Lisbon"))
+    try:
+        active_day = datetime.strptime(state["logical_day_key"], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+    if now.date() <= active_day:
+        return None
+
+    midnight = datetime.combine(now.date(), dt_time.min, tzinfo=ZoneInfo("Europe/Lisbon"))
+    last_activity = state.get("last_activity_time")
+    if last_activity:
+        last_activity = _make_aware(last_activity)
+        if last_activity >= midnight:
+            return last_activity + timedelta(hours=2)
+    return midnight + timedelta(hours=2)
+
+
+def update_daily_online(start_dt, end_dt, date_key=None):
     if not start_dt or not end_dt or end_dt <= start_dt:
         return
+    if date_key:
+        seconds = int((end_dt - start_dt).total_seconds())
+        daily_stats_collection.update_one(
+            {"_id": date_key},
+            {
+                "$inc": {"online_seconds": seconds, "total_game_seconds": 0},
+                "$setOnInsert": {"games": {}, "last_updated": datetime.now(ZoneInfo("Europe/Lisbon"))}
+            },
+            upsert=True
+        )
+        return
+
     parts = split_duration_by_date(start_dt, end_dt)
     for date_key, seconds in parts.items():
         daily_stats_collection.update_one(
             {"_id": date_key},
             {
                 "$inc": {"online_seconds": seconds, "total_game_seconds": 0},
-                "$setOnInsert": {"games": {}, "last_updated": datetime.now()}
+                "$setOnInsert": {"games": {}, "last_updated": datetime.now(ZoneInfo("Europe/Lisbon"))}
             },
             upsert=True
         )
@@ -220,20 +300,21 @@ def update_daily_online(start_dt, end_dt):
 def update_daily_game(place_id, game_name, seconds, date_key=None):
     if not place_id or not game_name or seconds <= 0:
         return
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Europe/Lisbon"))
+    game_key = sanitize_game_key(game_name)
     date_key = date_key or get_date_str(now)
     daily_stats_collection.update_one(
         {"_id": date_key},
         {
-            "$inc": {f"games.{place_id}.total_time": seconds, f"games.{place_id}.sessions": 1, "total_game_seconds": seconds},
-            "$set": {f"games.{place_id}.name": game_name, "last_updated": now}
+            "$inc": {f"games.{game_key}.total_time": seconds, f"games.{game_key}.sessions": 1, "total_game_seconds": seconds},
+            "$set": {f"games.{game_key}.name": game_name, f"games.{game_key}.place_id": str(place_id), "last_updated": now}
         },
         upsert=True
     )
 
 
 def get_daily_range(period, date_str=None):
-    today = datetime.now().date()
+    today = datetime.now(ZoneInfo("Europe/Lisbon")).date()
     if period in [None, "today"]:
         return today, today
     if period == "yesterday":
@@ -266,6 +347,35 @@ def format_seconds(seconds):
     return " ".join(parts)
 
 
+def get_relative_time_str(past_time):
+    """عرض الوقت بصيغة نسبية (منذ كام وقت) بالعربية"""
+    if not past_time:
+        return "❌ مفيش بيانات مسجلة - لم يكن الشخص أونلاين بعد"
+    
+    past_time = _make_aware(past_time)
+    if not past_time:
+        return "❌ مفيش بيانات مسجلة - لم يكن الشخص أونلاين بعد"
+    
+    diff = datetime.now(ZoneInfo("Europe/Lisbon")) - past_time
+    total_seconds = int(diff.total_seconds())
+    
+    # حساب الأيام والساعات والدقائق والثواني
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    
+    # بناء النتيجة بناءً على الفترة الزمنية
+    if days > 0:
+        return f"منذ {days} يوم و {hours} ساعة و {minutes} دقيقة"
+    elif hours > 0:
+        return f"منذ {hours} ساعة و {minutes} دقيقة و {seconds} ثانية"
+    elif minutes > 0:
+        return f"منذ {minutes} دقيقة و {seconds} ثانية"
+    else:
+        return f"منذ {seconds} ثانية فقط (أونلاين حالياً تقريباً)"
+
+
 def load_stats_for_period(start_date, end_date):
     query = {"_id": {"$gte": start_date.strftime("%Y-%m-%d"), "$lte": end_date.strftime("%Y-%m-%d")}}
     docs = daily_stats_collection.find(query)
@@ -273,8 +383,8 @@ def load_stats_for_period(start_date, end_date):
     game_totals = {}
     for doc in docs:
         total_online += doc.get("online_seconds", 0)
-        for place_id, game in doc.get("games", {}).items():
-            entry = game_totals.setdefault(place_id, {"name": game.get("name"), "total_time": 0, "sessions": 0})
+        for game_key, game in doc.get("games", {}).items():
+            entry = game_totals.setdefault(game_key, {"name": game.get("name"), "total_time": 0, "sessions": 0})
             entry["total_time"] += game.get("total_time", 0)
             entry["sessions"] += game.get("sessions", 0)
     return total_online, game_totals
@@ -312,6 +422,9 @@ def build_daily_summary_embed(date_key):
     total_maps = len(games)
     total_sessions = sum(game.get("sessions", 0) for game in games.values())
     total_game_seconds = sum(game.get("total_time", 0) for game in games.values())
+    # split online time into inside/outside maps
+    online_inside_maps = total_game_seconds
+    online_outside_maps = max(total_online - total_game_seconds, 0)
     most_played = None
     if games:
         most_played = max(games.items(), key=lambda x: x[1].get("total_time", 0))
@@ -321,15 +434,16 @@ def build_daily_summary_embed(date_key):
     title = f"📅 ملخص اليوم لليوم {date_display}"
     embed = discord.Embed(title=title, color=0x1abc9c)
     embed.add_field(name="🕒 الوقت الكلي أونلاين", value=f"**{format_seconds(total_online)}**", inline=False)
-    embed.add_field(name="🎮 الوقت الكلي في المابات", value=f"**{format_seconds(total_game_seconds)}**", inline=False)
+    embed.add_field(name="🎮 الوقت داخل المابات", value=f"**{format_seconds(online_inside_maps)}**", inline=False)
+    embed.add_field(name="🌐 الوقت خارج المابات", value=f"**{format_seconds(online_outside_maps)}**", inline=False)
     embed.add_field(name="🗺️ عدد المابات اللي لعبها", value=f"**{total_maps}** ماب", inline=True)
     embed.add_field(name="📊 عدد الجلسات", value=f"**{total_sessions}** جلسة", inline=True)
 
     if most_played:
-        place_id, game_data = most_played
+        game_key, game_data = most_played
         embed.add_field(
             name="🏆 أعلى ماب لعبها",
-            value=f"**{game_data.get('name', 'Unknown')}**\n⏱️ وقت اللعب: **{format_seconds(game_data.get('total_time', 0))}**\n📊 الجلسات: **{game_data.get('sessions', 0)}**\n🆔 `{place_id}`",
+            value=f"**{game_data.get('name', 'Unknown')}**\n⏱️ وقت اللعب: **{format_seconds(game_data.get('total_time', 0))}**\n📊 الجلسات: **{game_data.get('sessions', 0)}**\n🆔 `{game_key}`",
             inline=False
         )
     else:
@@ -343,10 +457,17 @@ def build_daily_summary_embed(date_key):
     else:
         embed.add_field(name="➕ أصدقاء جدد", value="لم يتم إضافة أصدقاء جدد اليوم.", inline=False)
 
+    # Avatar changes count
+    avatar_changes = doc.get("avatar_changes", 0)
+    if avatar_changes > 0:
+        embed.add_field(name="🎭 تغييرات الأفاتار", value=f"**{avatar_changes} مرة**", inline=False)
+    else:
+        embed.add_field(name="🎭 تغييرات الأفاتار", value="لم يتغير الأفاتار اليوم", inline=False)
+
     if games:
         top_games = sorted(games.items(), key=lambda x: x[1].get("total_time", 0), reverse=True)[:5]
         details = []
-        for idx, (place_id, info) in enumerate(top_games, 1):
+        for idx, (game_key, info) in enumerate(top_games, 1):
             details.append(f"**{idx}. {info.get('name', 'Unknown')}** — {format_seconds(info.get('total_time', 0))} في {info.get('sessions', 0)} جلسات")
         embed.add_field(name="📌 أهم 5 مابات", value="\n".join(details), inline=False)
     else:
@@ -401,7 +522,7 @@ def build_weekly_summary_embed():
     
     if sorted_games:
         details = []
-        for idx, (place_id, info) in enumerate(sorted_games[:5], 1):
+        for idx, (game_key, info) in enumerate(sorted_games[:5], 1):
             details.append(
                 f"**{idx}. {info.get('name', 'Unknown')}**\n"
                 f"  ⏱️ {format_seconds(info.get('total_time', 0))} | "
@@ -416,12 +537,15 @@ def build_weekly_summary_embed():
     new_friends_week = 0
     friends_data = load_friends_data()
     for f in friends_data.get("detected_new_friends", {}).values():
+        detected_at = f.get("detected_at", "")
+        dt = None
         try:
-            dt = datetime.strptime(f.get("detected_at", ""), "%Y-%m-%d %I:%M:%S %p")
-        except:
+            dt = datetime.strptime(detected_at, "%Y-%m-%d %I:%M:%S %p")
+        except Exception:
             try:
-                dt = datetime.strptime(f.get("detected_at", "")[:10], "%Y-%m-%d")
-            except:
+                dt = datetime.strptime(detected_at[:10], "%Y-%m-%d")
+            except Exception as e:
+                print(f"Warning: couldn't parse detected_at '{detected_at}': {e}")
                 continue
         if start_date <= dt.date() <= end_date:
             new_friends_week += 1
@@ -450,60 +574,135 @@ def build_weekly_summary_embed():
     return embed
 
 
+def build_detail_embeds(date_key):
+    """بناء قائمة embeds بتفاصيل الجلسات ليوم محدد"""
+    # Query session_logs
+    sessions = list(session_logs.find({"date_key": date_key}).sort("start_time", 1))
+    
+    # Query avatar changes first (needed for both cases)
+    daily_doc = daily_stats_collection.find_one({"_id": date_key}) or {}
+    avatar_changes = daily_doc.get("avatar_changes", 0)
+    
+    if not sessions:
+        # No sessions - return single embed with avatar_changes field
+        date_display = datetime.strptime(date_key, "%Y-%m-%d").strftime("%d/%m/%Y")
+        embed = discord.Embed(
+            title=f"📋 تفاصيل يوم {date_display}",
+            description="لا توجد جلسات مسجلة لهذا اليوم",
+            color=0x3498db
+        )
+        if avatar_changes > 0:
+            embed.add_field(
+                name="🎭 تغييرات الأفاتار",
+                value=f"**{avatar_changes} مرة**",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="🎭 تغييرات الأفاتار",
+                value="لم يتغير الأفاتار اليوم",
+                inline=False
+            )
+        embed.set_footer(text="تقرير تفصيلي كامل لكل جلسات اليوم")
+        return [embed]
+    
+    # Build embeds with max 20 session fields per embed
+    embeds = []
+    date_display = datetime.strptime(date_key, "%Y-%m-%d").strftime("%d/%m/%Y")
+    fields_added = 0
+    current_embed = discord.Embed(
+        title=f"📋 تفاصيل يوم {date_display}",
+        color=0x3498db
+    )
+    
+    total_sessions = len(sessions)
+    for idx, session in enumerate(sessions, start=1):
+        game_name = session.get("game_name", "Unknown")
+        start_time = session.get("start_time")
+        end_time = session.get("end_time")
+        duration_seconds = session.get("duration_seconds", 0)
+        
+        if start_time and end_time:
+            start_str = start_time.strftime("%H:%M:%S")
+            end_str = end_time.strftime("%H:%M:%S")
+        else:
+            start_str = "Unknown"
+            end_str = "Unknown"
+        
+        field_name = f"🎮 {game_name}"
+        field_value = f"🕒 من {start_str} لحد {end_str}\n⏱️ مدة: {format_seconds(duration_seconds)}"
+        current_embed.add_field(name=field_name, value=field_value, inline=False)
+        fields_added += 1
+        
+        # If we've added 20 fields and there are more sessions to add, create a new embed
+        if fields_added >= 20 and idx != total_sessions:
+            embeds.append(current_embed)
+            current_embed = discord.Embed(
+                title=f"📋 تفاصيل يوم {date_display} (متابعة)",
+                color=0x3498db
+            )
+            fields_added = 0
+    
+    # Add avatar changes field to the last embed
+    if avatar_changes > 0:
+        current_embed.add_field(
+            name="🎭 تغييرات الأفاتار",
+            value=f"**{avatar_changes} مرة**",
+            inline=False
+        )
+    else:
+        current_embed.add_field(
+            name="🎭 تغييرات الأفاتار",
+            value="لم يتغير الأفاتار اليوم",
+            inline=False
+        )
+    
+    current_embed.set_footer(text="تقرير تفصيلي كامل لكل جلسات اليوم")
+    embeds.append(current_embed)
+    
+    return embeds
+
+
 def record_game_session(place_id, game_name, duration_seconds, start_time=None, force_date=None):
     """تسجيل جلسة لعب جديدة"""
     if not place_id or not game_name or duration_seconds <= 0:
         return
     
     stats = load_games_stats()
+    game_key = sanitize_game_key(game_name)
     place_id_str = str(place_id)
     
-    if place_id_str not in stats:
-        stats[place_id_str] = {
+    if game_key not in stats:
+        stats[game_key] = {
             "name": game_name,
+            "place_id": place_id_str,
             "total_time": 0,
             "sessions": 0,
             "last_played": None
         }
     
-    stats[place_id_str]["total_time"] += duration_seconds
-    stats[place_id_str]["sessions"] += 1
-    stats[place_id_str]["last_played"] = datetime.now().isoformat()
+    stats[game_key]["total_time"] += duration_seconds
+    stats[game_key]["sessions"] += 1
+    stats[game_key]["place_id"] = place_id_str
+    stats[game_key]["last_played"] = datetime.now(ZoneInfo("Europe/Lisbon")).isoformat()
     
     save_games_stats(stats)
 
+    report_date_key = force_date or state.get("logical_day_key")
+    if not report_date_key and start_time:
+        report_date_key = start_time.strftime("%Y-%m-%d")
+
     if start_time:
         end_time = start_time + timedelta(seconds=duration_seconds)
-        parts = split_duration_by_date(start_time, end_time)
-        for date_key, seconds in parts.items():
-            update_daily_game(place_id_str, game_name, seconds, date_key=date_key)
+        log_session_entry(game_name, place_id, start_time, end_time, date_key=report_date_key)
+        if report_date_key:
+            update_daily_game(place_id, game_name, duration_seconds, date_key=report_date_key)
+        else:
+            parts = split_duration_by_date(start_time, end_time)
+            for date_key, seconds in parts.items():
+                update_daily_game(place_id, game_name, seconds, date_key=date_key)
     else:
-        update_daily_game(place_id_str, game_name, duration_seconds)
-
-def get_relative_time_str(past_time):
-    """عرض الوقت بصيغة نسبية (منذ كام وقت) بالعربية مع الثواني"""
-    if not past_time:
-        return "❌ مفيش بيانات مسجلة - لم يكن الشخص أونلاين بعد"
-    
-    diff = datetime.now() - past_time
-    total_seconds = int(diff.total_seconds())
-    
-    # حساب الأيام والساعات والدقائق والثواني
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-    
-    # بناء النتيجة بناءً على الفترة الزمنية
-    if days > 0:
-        return f"منذ {days} يوم و {hours} ساعة و {minutes} دقيقة"
-    elif hours > 0:
-        return f"منذ {hours} ساعة و {minutes} دقيقة و {seconds} ثانية"
-    elif minutes > 0:
-        return f"منذ {minutes} دقيقة و {seconds} ثانية"
-    else:
-        return f"منذ {seconds} ثانية فقط (أونلاين حالياً تقريباً)"
-
+        update_daily_game(place_id, game_name, duration_seconds, date_key=report_date_key)
 # --- جلب بيانات أي يوزر بالـ ID من روبلوكس ---
 async def fetch_single_user_profile(session, user_id):
     try:
@@ -511,8 +710,8 @@ async def fetch_single_user_profile(session, user_id):
             if r.status == 200:
                 data = await r.json()
                 return data.get("name"), data.get("displayName")
-    except:
-        pass
+    except Exception as e:
+        print(f"Error fetching user profile {user_id}: {e}")
     return None, None
 
 # --- جلب قائمة الأصدقاء كاملة ---
@@ -546,7 +745,7 @@ async def fetch_roblox_profile():
         if u_name:
             USER_NAME = u_name
             DISPLAY_NAME = d_name
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Target Loaded Successfully: {DISPLAY_NAME} (@{USER_NAME})")
+            print(f"[{datetime.now(ZoneInfo('Europe/Lisbon')).strftime('%H:%M:%S')}] Target Loaded Successfully: {DISPLAY_NAME} (@{USER_NAME})")
 
 @bot.event
 async def on_ready():
@@ -569,59 +768,102 @@ async def on_ready():
     state["last_activity_time"] = saved_state.get("last_activity_time")
     state["session_day_start"] = saved_state.get("session_day_start")
     state["offline_notification_sent"] = saved_state.get("offline_notification_sent", False)
+    state["logical_day_key"] = saved_state.get("logical_day_key")
+
+    if state["logical_day_key"] is None:
+        now = datetime.now(ZoneInfo("Europe/Lisbon"))
+        if state["last_activity_time"] and state["last_activity_time"].date() < now.date():
+            state["logical_day_key"] = state["last_activity_time"].strftime("%Y-%m-%d")
+        else:
+            state["logical_day_key"] = get_date_str(now)
+    state["session_day_start"] = state["logical_day_key"]
     roblox_radar_loop.start()
     daily_summary_task.start()
     weekly_summary_task.start()
 
 @bot.check
 async def check_channel(ctx):
+    if ctx.command and ctx.command.name == "detail":
+        return ctx.channel.id in [CMD_CHANNEL_ID, DETAIL_CHANNEL_ID]
     return ctx.channel.id == CMD_CHANNEL_ID
 
 # --- الأوامر التفاعلية ---
 
-@bot.command(name="commands")
-async def cmd_commands(ctx):
-    embed = discord.Embed(title="📖 قائمة الأوامر المتاحة (Commands Menu)", color=0x9b59b6)
-    
-    embed.add_field(name="📊 !lastseen", value="يعرض آخر وقت شُفت اللاعب فيه أونلاين\n**مثال:** `!lastseen`", inline=False)
-    embed.add_field(name="🎮 !lastgame", value="يعرض آخر ماب دخلها اللاعب ومنذ كام وقت\n**مثال:** `!lastgame`", inline=False)
-    embed.add_field(name="⏱️ !gametime", value="يعرض وقت اللعب الحالي في اللعبة المفتوحة الآن\n**مثال:** `!gametime`", inline=False)
-    embed.add_field(name="🔗 !join", value="يبعتلك رابط الدخول المباشر (Join Link) الحالي للعبة\n**مثال:** `!join`", inline=False)
-    embed.add_field(name="🗺️ !map", value="يعطيك رابط صفحة الماب الحالية على روبلوكس\n**مثال:** `!map`", inline=False)
-    embed.add_field(name="🏆 !top [3/custom/all]", value="اختر عدد الألعاب: 3، أو رقم مخصص، أو كل الألعاب المسجلة\n**أمثلة:** `!top 3`, `!top 5`, `!top all`", inline=False)
-    embed.add_field(name="📈 !totaltimeplayed", value="يعرض إجمالي ساعات اللعب لكل الألعاب مضافة\n**مثال:** `!totaltimeplayed`", inline=False)
-    embed.add_field(name="📊 !gamesstats", value="إحصائيات تفصيلية عن كل لعبة مع عدد الجلسات\n**مثال:** `!gamesstats`", inline=False)
-    embed.add_field(name="👤 !avatar", value="يعطيك صورة الأفاتار (الشخصية) في روبلوكس\n**مثال:** `!avatar`", inline=False)
-    embed.add_field(name="📝 !about", value="يعرض البايو (الوصف) الحالي في بروفايل اللاعب\n**مثال:** `!about`", inline=False)
-    embed.add_field(name="👥 !friendstest", value="يختبر ويعرض أول 10 أصدقاء من القائمة الكاملة\n**مثال:** `!friendstest`", inline=False)
-    embed.add_field(name="➕ !newfriends", value="يعرض آخر 5 أصدقاء جدد تم اكتشافهم\n**مثال:** `!newfriends`", inline=False)
-    embed.add_field(name="📜 !newhistoryfriends", value="يعرض السجل الكامل لجميع الأصدقاء الجدد المكتشفة من البداية\n**مثال:** `!newhistoryfriends`", inline=False)
-    embed.add_field(name="📊 !status", value="عرض حالة نظام الرادار والإحصائيات\n**مثال:** `!status`", inline=False)
-    embed.add_field(name="⏱️ !online", value="يعرض وقت الأونلاين اليومي أو الأسبوعي أو الشهري أو بتاريخ محدد\n**مثال:** `!online today`, `!online week`, `!online month`, `!online 2026-05-29`", inline=False)
-    embed.add_field(name="🗺️ !topmap", value="يعرض أكثر المابات لعباً لفترة محددة\n**مثال:** `!topmap yesterday`, `!topmap week`, `!topmap month`, `!topmap 2026-05-29`", inline=False)
-    embed.set_footer(text="اكتب الأمر في روم الأوامر المخصص ويرد عليك الرادار بسرعة ⚡")
+@bot.command(name="avatarc")
+async def cmd_avatarc(ctx):
+    """عدد تغييرات الأفاتار اليوم"""
+    report_date = get_active_report_date()
+    doc = daily_stats_collection.find_one({"_id": report_date}) or {}
+    count = doc.get("avatar_changes", 0)
+    embed = discord.Embed(title="📊 [عداد الأفاتار - اليوم]", color=0x3498db)
+    if count > 0:
+        embed.add_field(name="🎭 تغييرات الأفاتار اليوم", value=f"**{count} مرة**", inline=False)
+    else:
+        embed.add_field(name="🎭 تغييرات الأفاتار اليوم", value="لم يتغير الأفاتار اليوم", inline=False)
     await ctx.send(embed=embed)
 
-@bot.command(name="friendstest")
-async def cmd_friends_test(ctx):
-    await ctx.send("🔄 جاري فحص وجلب قائمة الأصدقاء من MongoDB...")
-    async with aiohttp.ClientSession() as session:
+
+@bot.command(name="avatarw")
+async def cmd_avatarw(ctx):
+    """عدد تغييرات الأفاتار للأسبوع الحالي (آخر 7 أيام)"""
+    today = datetime.now(ZoneInfo("Europe/Lisbon")).date()
+    start = today - timedelta(days=6)
+    query = {"_id": {"$gte": start.strftime("%Y-%m-%d"), "$lte": today.strftime("%Y-%m-%d")}}
+    docs = daily_stats_collection.find(query)
+    total = 0
+    for d in docs:
+        total += d.get("avatar_changes", 0)
+    embed = discord.Embed(title="📅 [عداد الأفاتار - الأسبوع الحالي]", color=0x9b59b6)
+    if total > 0:
+        embed.add_field(name="📆 إجمالي تغييرات الأفاتار خلال آخر 7 أيام", value=f"**{total} مرة**", inline=False)
+    else:
+        embed.add_field(name="📆 إجمالي تغييرات الأفاتار خلال آخر 7 أيام", value="لم يتغير الأفاتار خلال الأسبوع الحالي", inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="avatara")
+async def cmd_avatara(ctx):
+    """إجمالي تغييرات الأفاتار عبر التاريخ"""
+    docs = daily_stats_collection.find({}, {"avatar_changes": 1})
+    total = 0
+    for d in docs:
+        total += d.get("avatar_changes", 0)
+    embed = discord.Embed(title="👑 [عداد الأفاتار - التاريخ الكلي]", color=0xf1c40f)
+    if total > 0:
+        embed.add_field(name="📜 إجمالي تغييرات الأفاتار (الكل)", value=f"**{total} مرة**", inline=False)
+    else:
+        embed.add_field(name="📜 إجمالي تغييرات الأفاتار (الكل)", value="لم يتم تسجيل أي تغيير بالأفاتار حتى الآن", inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="detail")
+async def cmd_detail(ctx, date_arg: str = None):
+    """عرض تفاصيل الجلسات ليوم محدد"""
+    # Allow command in both CMD_CHANNEL_ID and DETAIL_CHANNEL_ID
+    if ctx.channel.id not in [CMD_CHANNEL_ID, DETAIL_CHANNEL_ID]:
+        return
+    
+    if date_arg is None:
+        # Default to yesterday
+        now = datetime.now(ZoneInfo("Europe/Lisbon"))
+        yesterday = now.date() - timedelta(days=1)
+        date_key = yesterday.strftime("%Y-%m-%d")
+    else:
+        # Validate format YYYY-MM-DD
         try:
-            friends = await fetch_all_friends(session)
-            if not friends:
-                await ctx.send("👤 قائمة الأصدقاء مخفية، فارغة، أو تعذر جلبها حالياً.")
-                return
-            
-            embed = discord.Embed(title=f"👥 اختبار قائمة الأصدقاء (عددها الكلي: {len(friends)})", color=0x3498db)
-            for f in friends[:10]:
-                fid = f.get('id')
-                real_username, real_display = await fetch_single_user_profile(session, fid)
-                if not real_username: real_username = f.get('name') or "Unknown"
-                if not real_display: real_display = f.get('displayName') or real_username
-                embed.add_field(name=real_display, value=f"@{real_username}\nID: `{fid}`", inline=False)
+            datetime.strptime(date_arg, "%Y-%m-%d")
+            date_key = date_arg
+        except ValueError:
+            await ctx.send("❌ تنسيق التاريخ غير صحيح. استخدم YYYY-MM-DD")
+            return
+    
+    embeds = build_detail_embeds(date_key)
+    try:
+        for embed in embeds:
             await ctx.send(embed=embed)
-        except Exception as e:
-            await ctx.send(f"❌ حدث خطأ: {str(e)[:50]}")
+    except Exception as e:
+        await ctx.send(f"❌ خطأ في إرسال التفاصيل: {str(e)}")
+
 
 @bot.command(name="lastseen")
 async def cmd_last_seen(ctx):
@@ -813,28 +1055,29 @@ async def cmd_top(ctx, limit: str = "3"):
         await ctx.send(embed=embed)
         return
     
-    total_hours_all = 0
+    total_seconds_all = 0
     total_sessions_all = 0
     
-    for idx, (place_id, data) in enumerate(sorted_games[:limit_num], 1):
+    for idx, (game_key, data) in enumerate(sorted_games[:limit_num], 1):
         if not isinstance(data, dict):
             continue
         total_seconds = data.get("total_time", 0)
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
         sessions = data.get("sessions", 0)
-        total_hours_all += hours
+        total_seconds_all += total_seconds
         total_sessions_all += sessions
-        
-        time_str = f"{hours}س {minutes}د" if hours > 0 else f"{minutes}د"
+
+        time_str = f"{hours}س {minutes}د {seconds}ث" if hours > 0 else (f"{minutes}د {seconds}ث" if minutes > 0 else f"{seconds}ث")
         
         embed.add_field(
             name=f"#{idx} - {data.get('name', 'Unknown')}",
-            value=f"⏱️ الوقت الكلي: **{time_str}**\n📊 عدد الجلسات: **{sessions}**\n🆔 Place ID: `{place_id}`",
+            value=f"⏱️ الوقت الكلي: **{time_str}**\n📊 عدد الجلسات: **{sessions}**\n🆔 Game Key: `{game_key}`",
             inline=False
         )
     
-    embed.set_footer(text=f"📊 الإجمالي: {total_hours_all} ساعة عبر {total_sessions_all} جلسة | يتم التحديث تلقائياً")
+    embed.set_footer(text=f"📊 الإجمالي: {format_seconds(total_seconds_all)} عبر {total_sessions_all} جلسة | يتم التحديث تلقائياً")
     await ctx.send(embed=embed)
 
 @bot.command(name="gametime")
@@ -844,7 +1087,7 @@ async def cmd_game_time(ctx):
         await ctx.send("❌ اللاعب غير لاعب الآن، لا يوجد وقت لعب")
         return
     
-    current_session_duration = int((datetime.now() - state["game_session_start"]).total_seconds())
+    current_session_duration = int((datetime.now(ZoneInfo("Europe/Lisbon")) - state["game_session_start"]).total_seconds())
     hours = current_session_duration // 3600
     minutes = (current_session_duration % 3600) // 60
     seconds = current_session_duration % 60
@@ -895,7 +1138,7 @@ async def cmd_games_stats(ctx):
     
     embed = discord.Embed(title="📊 إحصائيات الألعاب التفصيلية", color=0x9b59b6)
     
-    for idx, (place_id, data) in enumerate(sorted_games, 1):
+    for idx, (game_key, data) in enumerate(sorted_games, 1):
         if not isinstance(data, dict):
             continue
         total_seconds = data.get("total_time", 0)
@@ -911,7 +1154,7 @@ async def cmd_games_stats(ctx):
         
         embed.add_field(
             name=f"#{idx} - {data.get('name', 'Unknown')}",
-            value=f"⏱️ الكلي: **{time_str}**\n📊 الجلسات: **{sessions}**\n📌 المتوسط: **{avg_str}**\n🆔 ID: `{place_id}`",
+            value=f"⏱️ الكلي: **{time_str}**\n📊 الجلسات: **{sessions}**\n📌 المتوسط: **{avg_str}**\n🆔 Game Key: `{game_key}`",
             inline=False
         )
     
@@ -927,7 +1170,7 @@ async def cmd_status(ctx):
     baseline_count = len(data.get("baseline_ids", []))
     new_friends_count = len(data.get("detected_new_friends", {}))
     total_friends = len(data.get("friends_details", {}))
-    games_recorded = len([k for k in stats.keys() if k != "_id"])
+    games_recorded = len([k for k, v in stats.items() if isinstance(v, dict)])
     
     embed = discord.Embed(title="📊 حالة نظام الرادار (MongoDB)", color=0x00ff00)
     
@@ -961,12 +1204,77 @@ async def send_daily_summary(date_key):
     except Exception as e:
         print(f"Error sending daily summary: {e}")
 
+
+async def send_daily_detail(date_key):
+    """إرسال التقرير التفصيلي ليوم محدد إلى قناة التفاصيل"""
+    channel = bot.get_channel(DETAIL_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(DETAIL_CHANNEL_ID)
+        except Exception as e:
+            print(f"Error fetching detail channel: {e}")
+            return
+    
+    embeds = build_detail_embeds(date_key)
+    try:
+        for embed in embeds:
+            await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Error sending detail embeds: {e}")
+
+
+async def maybe_close_logical_day(now=None):
+    now = now or datetime.now(ZoneInfo("Europe/Lisbon"))
+    if state["status"] != 0 or not state.get("logical_day_key"):
+        return
+
+    deadline = get_logical_day_close_deadline(now)
+    if not deadline or now < deadline:
+        return
+
+    closed_day_key = state["logical_day_key"]
+    if state.get("online_session_start"):
+        update_daily_online(state["online_session_start"], now, date_key=closed_day_key)
+        state["online_session_start"] = None
+
+    embed = discord.Embed(
+        title="🔴 [الهدف أوفلاين الآن - اليوم انتهى]",
+        description=(
+            f"اللاعب بقي أوفلاين لمدة ساعتين بعد آخر نشاط بعد منتصف الليل.\n"
+            f"آخر نشاط: {state['last_activity_time'].strftime('%H:%M:%S') if state.get('last_activity_time') else 'Unknown'}\n\n"
+            "✅ اليوم السابق اتسجل وانتهى!"
+        ),
+        color=0x7f8c8d
+    )
+
+    alert_channel = bot.get_channel(ALERT_CHANNEL_ID)
+    if alert_channel is None:
+        try:
+            alert_channel = await bot.fetch_channel(ALERT_CHANNEL_ID)
+        except Exception as e:
+            print(f"Error fetching alert channel for logical day close: {e}")
+            alert_channel = None
+
+    if alert_channel:
+        try:
+            await alert_channel.send(embed=embed)
+        except Exception as e:
+            print(f"Error sending logical day close embed: {e}")
+
+    await send_daily_summary(closed_day_key)
+    await send_daily_detail(closed_day_key)
+
+    state["logical_day_key"] = get_date_str(now)
+    state["session_day_start"] = state["logical_day_key"]
+    state["offline_notification_sent"] = True
+    state["offline_since"] = None
+    state["offline_alert_sent"] = False
+    state["last_activity_time"] = None
+
+
 @tasks.loop(time=dt_time(0, 0, 0, tzinfo=ZoneInfo("Europe/Lisbon")))
 async def daily_summary_task():
-    now = datetime.now(ZoneInfo("Europe/Lisbon"))
-    yesterday = now.date() - timedelta(days=1)
-    date_key = yesterday.strftime("%Y-%m-%d")
-    await send_daily_summary(date_key)
+    await maybe_close_logical_day(datetime.now(ZoneInfo("Europe/Lisbon")))
 
 @tasks.loop(time=dt_time(1, 0, 0, tzinfo=ZoneInfo("Europe/Lisbon")))
 async def weekly_summary_task():
@@ -995,12 +1303,21 @@ async def cmd_online(ctx, period: str = "today", date_arg: str = None):
             query = date_arg
         else:
             return await ctx.send("❌ استخدم: `!online today`, `!online week`, `!online month`, أو `!online YYYY-MM-DD`")
+    # For 'today' use logical day key instead of calendar date
+    if query == "today":
+        date_key = get_active_report_date()
+        try:
+            parsed = datetime.strptime(date_key, "%Y-%m-%d").date()
+            start_date, end_date = parsed, parsed
+        except Exception:
+            start_date, end_date = get_daily_range(query, date_str=query)
+    else:
+        start_date, end_date = get_daily_range(query, date_str=query)
 
-    start_date, end_date = get_daily_range(query, date_str=query)
     if not start_date or not end_date:
         return await ctx.send("❌ التنسيق غير صحيح. استخدم YYYY-MM-DD أو one of today/yesterday/week/month.")
 
-    total_online, _ = load_stats_for_period(start_date, end_date)
+    total_online, game_totals = load_stats_for_period(start_date, end_date)
     period_text = f"منذ {start_date.strftime('%Y-%m-%d')}" if start_date != end_date else f"في {start_date.strftime('%Y-%m-%d')}"
     if query == "today":
         title = "⏱️ وقت الأونلاين اليوم"
@@ -1029,7 +1346,17 @@ async def cmd_top_map(ctx, period: str = "yesterday", date_arg: str = None):
         else:
             return await ctx.send("❌ استخدم: `!topmap yesterday`, `!topmap week`, `!topmap month`, أو `!topmap YYYY-MM-DD`")
 
-    start_date, end_date = get_daily_range(query, date_str=query)
+    # For 'today' use logical day if available
+    if query == "today":
+        date_key = get_active_report_date()
+        try:
+            parsed = datetime.strptime(date_key, "%Y-%m-%d").date()
+            start_date, end_date = parsed, parsed
+        except Exception:
+            start_date, end_date = get_daily_range(query, date_str=query)
+    else:
+        start_date, end_date = get_daily_range(query, date_str=query)
+
     if not start_date or not end_date:
         return await ctx.send("❌ التنسيق غير صحيح. استخدم YYYY-MM-DD أو one of yesterday/week/month.")
 
@@ -1054,12 +1381,12 @@ async def cmd_top_map(ctx, period: str = "yesterday", date_arg: str = None):
         description = f"في {start_date.strftime('%Y-%m-%d')}"
 
     embed = discord.Embed(title=title, description=description, color=0x9b59b6)
-    for idx, (place_id, data) in enumerate(top_games, 1):
+    for idx, (game_key, data) in enumerate(top_games, 1):
         time_str = format_seconds(data.get("total_time", 0))
         sessions = data.get("sessions", 0)
         embed.add_field(
             name=f"#{idx} - {data.get('name', 'Unknown')}",
-            value=f"⏱️ وقت اللعب: **{time_str}**\n📊 عدد الجلسات: **{sessions}**\n🆔 Place ID: `{place_id}`",
+            value=f"⏱️ وقت اللعب: **{time_str}**\n📊 عدد الجلسات: **{sessions}**\n🆔 Game Key: `{game_key}`",
             inline=False
         )
     embed.set_footer(text="يعتمد على سجل المابات اليومية والبيانات المجمعة")
@@ -1073,6 +1400,9 @@ async def roblox_radar_loop():
     alert_channel = bot.get_channel(ALERT_CHANNEL_ID)
     if not alert_channel: return
 
+    now = datetime.now(ZoneInfo("Europe/Lisbon"))
+    await maybe_close_logical_day(now)
+
     async with aiohttp.ClientSession() as session:
         try:
             # 1. فحص الحالة والنشاط والمابات
@@ -1084,7 +1414,6 @@ async def roblox_radar_loop():
                     game = presence.get("lastLocation", "Unknown")
                     place_id = presence.get("placeId")
                     game_id = presence.get("gameId")
-                    now = datetime.now()
 
                     previous_status = state["status"]
                     current_avatar_url = await fetch_avatar_urls(session)
@@ -1102,6 +1431,15 @@ async def roblox_radar_loop():
                             embed_privacy.add_field(name="🌐 رابط الأفاتار الجديد", value=current_avatar_url, inline=False)
                             await alert_channel.send(embed=embed_privacy)
                             state["privacy_alert_sent"] = True
+                            # Log avatar change in daily stats using logical day key
+                            try:
+                                daily_stats_collection.update_one(
+                                    {"_id": get_active_report_date()},
+                                    {"$inc": {"avatar_changes": 1}},
+                                    upsert=True
+                                )
+                            except Exception:
+                                pass
                             state["last_avatar_url"] = current_avatar_url
                         elif status != 0:
                             state["privacy_alert_sent"] = False
@@ -1111,6 +1449,19 @@ async def roblox_radar_loop():
                         if now - state["pending_resume_leave_time"] > timedelta(minutes=10) and not state["session_recorded"]:
                             leave_duration = int((state["pending_resume_leave_time"] - state["game_session_start"]).total_seconds()) if state["game_session_start"] else 0
                             record_game_session(state["pending_resume_place_id"], state["pending_resume_game_name"], leave_duration, start_time=state["game_session_start"])
+
+                            start_time_str = state["game_session_start"].strftime("%H:%M:%S") if state["game_session_start"] else "Unknown"
+                            end_time_str = state["pending_resume_leave_time"].strftime("%H:%M:%S") if state["pending_resume_leave_time"] else "Unknown"
+                            embed_recorded = discord.Embed(
+                                title="✅ [جلسة تم تسجيلها]",
+                                color=0x2ecc71
+                            )
+                            embed_recorded.add_field(name="🎮 الماب", value=f"**{state['pending_resume_game_name']}**", inline=False)
+                            embed_recorded.add_field(name="⏱️ المدة الكلية", value=f"**{format_seconds(leave_duration)}**", inline=False)
+                            embed_recorded.add_field(name="🕐 بدأت", value=f"`{start_time_str}`", inline=True)
+                            embed_recorded.add_field(name="🕑 انتهت", value=f"`{end_time_str}`", inline=True)
+                            await alert_channel.send(embed=embed_recorded)
+
                             state["session_recorded"] = True
                             state["pending_resume"] = False
                             state["game_session_start"] = None
@@ -1142,6 +1493,7 @@ async def roblox_radar_loop():
                         await alert_channel.send(embed=embed)
                         state["offline_alert_sent"] = False
                         state["offline_since"] = None
+                        state["offline_notification_sent"] = False
 
                     if status == 2 and previous_status == 2 and place_id != state["place_id"]:
                         # اللاعب غير اللعبة خلال حالة متصلة 2، اعتبر ذلك جلسة جديدة للماب الجديدة
@@ -1239,21 +1591,31 @@ async def roblox_radar_loop():
 
                     # النظام الذكي: انتظر ساعتين من آخر نشاط قبل إنهاء اليوم
                     if status == 0 and state["last_activity_time"] and not state["offline_notification_sent"]:
-                        if now - state["last_activity_time"] >= timedelta(hours=2):
-                            # حفظ الجلسة الحالية
+                        deadline = get_logical_day_close_deadline(now)
+                        if deadline and now >= deadline:
+                            # حفظ الجلسة الحالية ضمن اليوم المنطقي القديم
                             if state["online_session_start"]:
-                                update_daily_online(state["online_session_start"], now)
+                                update_daily_online(state["online_session_start"], now, date_key=state.get("logical_day_key"))
                                 state["online_session_start"] = None
                             
                             embed = discord.Embed(
                                 title="🔴 [الهدف أوفلاين الآن - اليوم انتهى]",
-                                description=f"اللاعب بقي أوفلاين لمدة ساعتين كاملة من آخر نشاط.\\nآخر نشاط: {state['last_activity_time'].strftime('%H:%M:%S')}\\n\\n✅ اليوم الحالي اتسجل وانتهى!",
+                                description=(
+                                    f"اللاعب بقي أوفلاين لمدة ساعتين بعد آخر نشاط بعد منتصف الليل.\\n"
+                                    f"آخر نشاط: {state['last_activity_time'].strftime('%H:%M:%S') if state.get('last_activity_time') else 'Unknown'}\\n\\n"
+                                    "✅ اليوم السابق اتسجل وانتهى!"
+                                ),
                                 color=0x7f8c8d
                             )
                             await alert_channel.send(embed=embed)
+                            await send_daily_summary(state.get("logical_day_key"))
+                            await send_daily_detail(state.get("logical_day_key"))
+                            state["logical_day_key"] = get_date_str(now)
+                            state["session_day_start"] = state["logical_day_key"]
                             state["offline_notification_sent"] = True
+                            state["offline_since"] = None
+                            state["offline_alert_sent"] = False
                             state["last_activity_time"] = None
-                            state["session_day_start"] = None
 
                     if status != state["status"]: state["status"] = status
                     if status == 2: state["game"] = game
@@ -1265,7 +1627,7 @@ async def roblox_radar_loop():
                 friends_data = load_friends_data()
                 
                 if not friends_data["baseline_ids"]:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] First run! Storing ALL baseline to MongoDB silently...")
+                    print(f"[{datetime.now(ZoneInfo('Europe/Lisbon')).strftime('%H:%M:%S')}] First run! Storing ALL baseline to MongoDB silently...")
                     friends_data["baseline_ids"] = current_ids
                     for f in curr_friends:
                         fid = str(f["id"])
@@ -1288,7 +1650,7 @@ async def roblox_radar_loop():
                             if not real_username: real_username = f.get("name") or "Unknown"
                             if not real_display: real_display = f.get("displayName") or real_username
                             
-                            now_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+                            now_str = datetime.now(ZoneInfo("Europe/Lisbon")).strftime("%Y-%m-%d %I:%M:%S %p")
                             
                             friends_data["detected_new_friends"][fid_str] = {
                                 "username": real_username,
