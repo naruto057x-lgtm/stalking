@@ -7,6 +7,7 @@ import aiohttp
 import json
 import os
 import sys
+import hashlib
 from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 from pymongo import MongoClient
@@ -31,6 +32,8 @@ ALERT_CHANNEL_ID = 1509345547197091940
 DAILY_SUMMARY_CHANNEL_ID = 1510270977513099296
 WEEKLY_SUMMARY_CHANNEL_ID = 1510275621316595802
 DETAIL_CHANNEL_ID = 1510541538445230080
+AVATAR_CHANGE_CHANNEL_ID = 1510752801196871850
+TIMELINE_CHANNEL_ID = 1510754643414876301
 
 # ==================== MongoDB Configuration ====================
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://marwangamer056_db_user:NulNLKsdAz55Av50@cluster0.j35ail6.mongodb.net/?appName=Cluster0")
@@ -62,6 +65,9 @@ state = {
     "pending_resume_game_name": None,
     "pending_resume_leave_time": None,
     "last_avatar_url": None,
+    "last_avatar_hash": None,
+    "timeline_current_session_start": None,
+    "timeline_last_offline_time": None,
     "privacy_alert_sent": False,
     "last_activity_time": None,
     "session_day_start": None,
@@ -90,6 +96,7 @@ games_collection = db.games
 state_collection = db.state
 daily_stats_collection = db.daily_stats
 session_logs = db.session_logs
+daily_timeline_collection = db.daily_timeline
 
 # ==================== Database Helper Functions ====================
 def load_friends_data():
@@ -150,6 +157,9 @@ def load_state_data():
             "pending_resume_game_name": doc.get("pending_resume_game_name"),
             "pending_resume_leave_time": _make_aware(doc.get("pending_resume_leave_time")),
             "last_avatar_url": doc.get("last_avatar_url"),
+            "last_avatar_hash": doc.get("last_avatar_hash"),
+            "timeline_current_session_start": _make_aware(doc.get("timeline_current_session_start")),
+            "timeline_last_offline_time": _make_aware(doc.get("timeline_last_offline_time")),
             "privacy_alert_sent": doc.get("privacy_alert_sent", False),
             "last_activity_time": _make_aware(doc.get("last_activity_time")),
             "session_day_start": doc.get("session_day_start"),
@@ -167,6 +177,9 @@ def load_state_data():
         "pending_resume_game_name": None,
         "pending_resume_leave_time": None,
         "last_avatar_url": None,
+        "last_avatar_hash": None,
+        "timeline_current_session_start": None,
+        "timeline_last_offline_time": None,
         "privacy_alert_sent": False,
         "last_activity_time": None,
         "session_day_start": None,
@@ -191,6 +204,9 @@ def save_state_data():
             "pending_resume_game_name": state.get("pending_resume_game_name"),
             "pending_resume_leave_time": state.get("pending_resume_leave_time"),
             "last_avatar_url": state.get("last_avatar_url"),
+            "last_avatar_hash": state.get("last_avatar_hash"),
+            "timeline_current_session_start": state.get("timeline_current_session_start"),
+            "timeline_last_offline_time": state.get("timeline_last_offline_time"),
             "privacy_alert_sent": state.get("privacy_alert_sent", False),
             "last_activity_time": state.get("last_activity_time"),
             "session_day_start": state.get("session_day_start"),
@@ -769,6 +785,9 @@ async def on_ready():
     state["session_day_start"] = saved_state.get("session_day_start")
     state["offline_notification_sent"] = saved_state.get("offline_notification_sent", False)
     state["logical_day_key"] = saved_state.get("logical_day_key")
+    state["last_avatar_hash"] = saved_state.get("last_avatar_hash")
+    state["timeline_current_session_start"] = saved_state.get("timeline_current_session_start")
+    state["timeline_last_offline_time"] = saved_state.get("timeline_last_offline_time")
 
     if state["logical_day_key"] is None:
         now = datetime.now(ZoneInfo("Europe/Lisbon"))
@@ -780,6 +799,7 @@ async def on_ready():
     roblox_radar_loop.start()
     daily_summary_task.start()
     weekly_summary_task.start()
+    daily_timeline_task.start()
 
 @bot.check
 async def check_channel(ctx):
@@ -1007,6 +1027,20 @@ async def fetch_avatar_urls(session):
     except Exception as e:
         print(f"Error fetching avatar URLs: {e}")
     
+    return None
+
+
+async def fetch_image_hash(session, image_url):
+    """Download image bytes and return sha256 hexdigest, or None on failure."""
+    if not image_url:
+        return None
+    try:
+        async with session.get(image_url, timeout=10) as r:
+            if r.status == 200:
+                data = await r.read()
+                return hashlib.sha256(data).hexdigest()
+    except Exception as e:
+        print(f"Error fetching avatar image for hash: {e}")
     return None
 
 @bot.command(name="avatar")
@@ -1249,6 +1283,221 @@ async def send_daily_detail(date_key):
         print(f"Error sending detail embeds: {e}")
 
 
+def split_intervals_by_date(start_dt, end_dt):
+    """Split an interval into (date_key, seg_start, seg_end, seconds) for each calendar date.
+    Both start_dt and end_dt must be timezone-aware in Europe/Lisbon."""
+    parts = []
+    if not start_dt or not end_dt or end_dt <= start_dt:
+        return parts
+    current = start_dt
+    tz = ZoneInfo("Europe/Lisbon")
+    while current < end_dt:
+        next_midnight = datetime.combine(current.date() + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+        seg_end = min(end_dt, next_midnight)
+        date_key = get_date_str(current)
+        seconds = int((seg_end - current).total_seconds())
+        parts.append((date_key, current, seg_end, seconds))
+        current = seg_end
+    return parts
+
+
+def record_timeline_session(start_dt, end_dt):
+    """Record online timeline session, splitting across calendar dates into daily_timeline_collection."""
+    if not start_dt or not end_dt or end_dt <= start_dt:
+        return
+    try:
+        segments = split_intervals_by_date(start_dt, end_dt)
+        now = datetime.now(ZoneInfo("Europe/Lisbon"))
+        for date_key, seg_start, seg_end, seconds in segments:
+            try:
+                # Read existing sessions for the date
+                doc = daily_timeline_collection.find_one({"_id": date_key}) or {}
+                existing = doc.get("sessions", [])
+
+                # Build list of intervals in seconds for merging
+                intervals = []
+                for s in existing:
+                    try:
+                        sst = s.get("start_time")
+                        sed = s.get("end_time")
+                        if sst and sed:
+                            intervals.append((int(sst.timestamp()), int(sed.timestamp())))
+                    except Exception:
+                        continue
+
+                # Append new segment
+                intervals.append((int(seg_start.timestamp()), int(seg_end.timestamp())))
+
+                # Merge intervals
+                intervals.sort(key=lambda x: x[0])
+                merged = []
+                for iv in intervals:
+                    if not merged:
+                        merged.append(list(iv))
+                    else:
+                        last = merged[-1]
+                        if iv[0] <= last[1]:
+                            # overlap or adjacent -> merge
+                            last[1] = max(last[1], iv[1])
+                        else:
+                            merged.append([iv[0], iv[1]])
+
+                # Reconstruct sessions list and total seconds
+                new_sessions = []
+                total_seconds = 0
+                for a, b in merged:
+                    st_dt = datetime.fromtimestamp(a, tz=ZoneInfo("Europe/Lisbon"))
+                    ed_dt = datetime.fromtimestamp(b, tz=ZoneInfo("Europe/Lisbon"))
+                    dur = int(b - a)
+                    total_seconds += dur
+                    new_sessions.append({"start_time": st_dt, "end_time": ed_dt, "duration_seconds": dur})
+
+                # Update document atomically (replace sessions + total_online_seconds)
+                daily_timeline_collection.update_one(
+                    {"_id": date_key},
+                    {
+                        "$set": {"sessions": new_sessions, "total_online_seconds": total_seconds},
+                        "$setOnInsert": {"created_at": now}
+                    },
+                    upsert=True
+                )
+            except Exception as e:
+                print(f"Error recording timeline segment for {date_key}: {e}")
+    except Exception as e:
+        print(f"Error recording timeline session: {e}")
+
+
+def build_daily_timeline_embeds(date_key, include_open_session=False):
+    """Build embeds for a given calendar date. If include_open_session=True, include any current open session (to Now).
+    date_key must be YYYY-MM-DD."""
+    doc = daily_timeline_collection.find_one({"_id": date_key}) or {}
+    sessions = list(doc.get("sessions", []))
+    total_online = doc.get("total_online_seconds", 0) or 0
+    date_display = datetime.strptime(date_key, "%Y-%m-%d").strftime("%d/%m/%Y")
+
+    # If there's an open session that started today (or earlier but continues), add a synthetic session
+    now = datetime.now(ZoneInfo("Europe/Lisbon"))
+    added_open = False
+    if include_open_session and state.get("timeline_current_session_start"):
+        try:
+            start = _make_aware(state.get("timeline_current_session_start"))
+            # Only include the portion for this calendar date
+            day_start = datetime.combine(datetime.strptime(date_key, "%Y-%m-%d").date(), dt_time.min, tzinfo=ZoneInfo("Europe/Lisbon"))
+            seg_start = start if start >= day_start else day_start
+            # Determine if session should be considered open relative to now (within merge window or online)
+            loff = state.get("timeline_last_offline_time")
+            include_now = False
+            if state.get("status") in [1,2,3]:
+                include_now = True
+            elif loff:
+                loff = _make_aware(loff)
+                if (now - loff) < timedelta(minutes=30):
+                    include_now = True
+
+            if include_now and seg_start < now:
+                dur = int((now - seg_start).total_seconds())
+                # Append a synthetic session entry (end_time=None to indicate 'Now')
+                sessions.append({"start_time": seg_start, "end_time": None, "duration_seconds": dur, "_open": True})
+                total_online += dur
+                added_open = True
+        except Exception:
+            pass
+
+    # Sort sessions by start_time
+    sessions_sorted = sorted(sessions, key=lambda x: x.get("start_time") or datetime.min)
+
+    if not sessions_sorted:
+        embed = discord.Embed(title=f"📅 Daily Online Timeline — {date_display}", description="No sessions recorded for this day.", color=0x3498db)
+        embed.add_field(name="⏰ Total Online", value=f"**{format_seconds(total_online)}**", inline=False)
+        embed.add_field(name="📊 Sessions Count", value="0", inline=False)
+        return [embed]
+
+    embeds = []
+    current_embed = discord.Embed(title=f"📅 Daily Online Timeline — {date_display}", color=0x3498db)
+    current_embed.add_field(name="⏰ Total Online", value=f"**{format_seconds(total_online)}**", inline=False)
+
+    fields_added = 0
+    session_count = 0
+    for s in sessions_sorted:
+        session_count += 1
+        st = s.get("start_time")
+        ed = s.get("end_time")
+        dur = s.get("duration_seconds", 0)
+        try:
+            st_str = st.strftime("%I:%M %p") if st else "Unknown"
+            if ed:
+                ed_str = ed.strftime("%I:%M %p")
+            else:
+                ed_str = "Now"
+        except Exception:
+            st_str = str(st)
+            ed_str = str(ed) if ed else "Now"
+
+        current_embed.add_field(name=f"Session #{session_count}", value=f"{st_str} → {ed_str}\nDuration: {format_seconds(dur)}", inline=False)
+        fields_added += 1
+        if fields_added >= 10:
+            embeds.append(current_embed)
+            current_embed = discord.Embed(title=f"📅 Daily Online Timeline — {date_display} (continued)", color=0x3498db)
+            fields_added = 0
+
+    # Footer info
+    current_embed.add_field(name="Total Online", value=f"**{format_seconds(total_online)}**", inline=True)
+    current_embed.add_field(name="Sessions Count", value=f"{session_count}", inline=True)
+    embeds.append(current_embed)
+    return embeds
+
+
+async def send_daily_timeline(date_key):
+    channel = bot.get_channel(TIMELINE_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(TIMELINE_CHANNEL_ID)
+        except Exception as e:
+            print(f"Error fetching timeline channel: {e}")
+            return
+    embeds = build_daily_timeline_embeds(date_key)
+    try:
+        for e in embeds:
+            await channel.send(embed=e)
+    except Exception as e:
+        print(f"Error sending timeline embeds: {e}")
+
+
+@tasks.loop(time=dt_time(0, 0, 0, tzinfo=ZoneInfo("Europe/Lisbon")))
+async def daily_timeline_task():
+    now = datetime.now(ZoneInfo("Europe/Lisbon"))
+    # Close any crossing session at midnight: record portion up to midnight for yesterday
+    midnight = datetime.combine(now.date(), dt_time.min, tzinfo=ZoneInfo("Europe/Lisbon"))
+    yesterday = midnight - timedelta(days=1)
+    # If there's an open timeline session that started before midnight, record its part until midnight
+    try:
+        if state.get("timeline_current_session_start"):
+            start = _make_aware(state.get("timeline_current_session_start"))
+            if start and start < midnight:
+                # record segment from start to midnight
+                record_timeline_session(start, midnight)
+                # if user still considered online or within 30min offline, continue session from midnight
+                if state.get("status") in [1,2,3]:
+                    state["timeline_current_session_start"] = midnight
+                else:
+                    # if offline but within 30 minutes since offline, continue
+                    loff = state.get("timeline_last_offline_time")
+                    if loff:
+                        loff = _make_aware(loff)
+                        if (midnight - loff) < timedelta(minutes=30):
+                            state["timeline_current_session_start"] = midnight
+                        else:
+                            state["timeline_current_session_start"] = None
+                            state["timeline_last_offline_time"] = None
+                save_state_data()
+    except Exception as e:
+        print(f"Error handling open timeline session at midnight: {e}")
+
+    # Send timeline for yesterday (date_key)
+    date_key = yesterday.strftime("%Y-%m-%d")
+    await send_daily_timeline(date_key)
+
+
 async def maybe_close_logical_day(now=None):
     now = now or datetime.now(ZoneInfo("Europe/Lisbon"))
     if state["status"] != 0 or not state.get("logical_day_key"):
@@ -1289,6 +1538,33 @@ async def maybe_close_logical_day(now=None):
 
     await send_daily_summary(closed_day_key)
     await send_daily_detail(closed_day_key)
+
+    # Notify avatar change count for the closed logical day in the avatar channel
+    try:
+        avatar_doc = daily_stats_collection.find_one({"_id": closed_day_key}) or {}
+        avatar_changes_count = avatar_doc.get("avatar_changes", 0)
+        avatar_channel = bot.get_channel(AVATAR_CHANGE_CHANNEL_ID)
+        if avatar_channel is None:
+            try:
+                avatar_channel = await bot.fetch_channel(AVATAR_CHANGE_CHANNEL_ID)
+            except Exception as e:
+                avatar_channel = None
+                print(f"Error fetching avatar channel for day close: {e}")
+
+        if avatar_channel:
+            try:
+                date_display = datetime.strptime(closed_day_key, "%Y-%m-%d").strftime("%d/%m/%Y")
+                embed_avatar_summary = discord.Embed(
+                    title=f"📸 تغييرات الأفاتار ليوم {date_display}",
+                    description=f"عدد تغييرات الأفاتار المسجلة خلال اليوم: **{avatar_changes_count}**",
+                    color=0x3498db
+                )
+                embed_avatar_summary.set_footer(text="تم الإرسال عند نهاية اليوم المنطقي")
+                await avatar_channel.send(embed=embed_avatar_summary)
+            except Exception as e:
+                print(f"Error sending avatar day summary: {e}")
+    except Exception as e:
+        print(f"Error preparing avatar day summary: {e}")
 
     state["logical_day_key"] = get_date_str(now)
     state["session_day_start"] = state["logical_day_key"]
@@ -1362,6 +1638,23 @@ async def cmd_online(ctx, period: str = "today", date_arg: str = None):
     embed.add_field(name="⏰ الوقت الكلي", value=f"**{format_seconds(total_online)}**", inline=False)
     embed.set_footer(text="مبني على بيانات الأونلاين اليومية المسجلة")
     await ctx.send(embed=embed)
+
+
+@bot.command(name="timeline")
+async def cmd_timeline(ctx):
+    """عرض الـ Daily Online Timeline لليوم الميلادي الحالي (فقط في قناة الـ Timeline)."""
+    if ctx.channel.id != TIMELINE_CHANNEL_ID:
+        await ctx.send("❌ هذا الأمر مسموح فقط في قناة سجل الأونلاين اليومية.")
+        return
+
+    now = datetime.now(ZoneInfo("Europe/Lisbon"))
+    date_key = now.strftime("%Y-%m-%d")
+    embeds = build_daily_timeline_embeds(date_key, include_open_session=True)
+    try:
+        for e in embeds:
+            await ctx.send(embed=e)
+    except Exception as e:
+        await ctx.send(f"❌ خطأ أثناء إرسال التقرير: {e}")
 
 @bot.command(name="topmap", aliases=["maptop", "mapstats"])
 async def cmd_top_map(ctx, period: str = "yesterday", date_arg: str = None):
@@ -1444,32 +1737,124 @@ async def roblox_radar_loop():
                     previous_status = state["status"]
                     current_avatar_url = await fetch_avatar_urls(session)
                     if current_avatar_url:
-                        if state["last_avatar_url"] is None:
+                        # Compute image hash for robust detection
+                        current_avatar_hash = await fetch_image_hash(session, current_avatar_url)
+
+                        # First run: store last avatar URL+hash silently
+                        if state.get("last_avatar_url") is None and not state.get("last_avatar_hash"):
                             state["last_avatar_url"] = current_avatar_url
-                        elif status == 0 and state["last_avatar_url"] != current_avatar_url and not state["privacy_alert_sent"]:
-                            embed_privacy = discord.Embed(
-                                title="⚠️ [تحذير: تغيير الأفاتار أثناء الأوفلاين]",
-                                description="يبدو أن الهدف غيّر الأفاتار وهو في وضع عدم الظهور، قد يكون مخفي أونلاين رغم ظهوره كأوفلاين.",
-                                color=0xe74c3c
-                            )
-                            embed_privacy.add_field(name="⛔ الحالة الحالية", value="أوفلاين رسميًا لكن الأفاتار تغير", inline=False)
-                            embed_privacy.add_field(name="🧠 معنى ذلك", value="ممكن يكون المستخدم مستخدم الوضع الخاص لإخفاء ظهور الأونلاين.", inline=False)
-                            embed_privacy.add_field(name="🌐 رابط الأفاتار الجديد", value=current_avatar_url, inline=False)
-                            await alert_channel.send(embed=embed_privacy)
-                            state["privacy_alert_sent"] = True
-                            # Log avatar change in daily stats using logical day key
+                            state["last_avatar_hash"] = current_avatar_hash
+                        else:
+                            changed = False
                             try:
-                                daily_stats_collection.update_one(
-                                    {"_id": get_active_report_date()},
-                                    {"$inc": {"avatar_changes": 1}},
-                                    upsert=True
-                                )
+                                # Prefer hash comparison when available to avoid CDN/URL churn
+                                last_hash = state.get("last_avatar_hash")
+                                if last_hash and current_avatar_hash:
+                                    changed = (last_hash != current_avatar_hash)
+                                else:
+                                    last_url = state.get("last_avatar_url")
+                                    if last_url and current_avatar_url:
+                                        changed = (last_url != current_avatar_url)
                             except Exception:
-                                pass
-                            state["last_avatar_url"] = current_avatar_url
-                        elif status != 0:
-                            state["privacy_alert_sent"] = False
-                            state["last_avatar_url"] = current_avatar_url
+                                changed = False
+
+                            if changed:
+                                # Increment daily avatar change counter (logical day)
+                                try:
+                                    daily_stats_collection.update_one(
+                                        {"_id": get_active_report_date()},
+                                        {"$inc": {"avatar_changes": 1}},
+                                        upsert=True
+                                    )
+                                except Exception as e:
+                                    print(f"Error incrementing avatar_changes: {e}")
+
+                                # Classify whether change happened after >=5 minutes offline
+                                changed_while_offline_long = False
+                                if status == 0:
+                                    ref_time = state.get("offline_since") or state.get("last_online_time")
+                                    if ref_time:
+                                        ref_time = _make_aware(ref_time)
+                                        try:
+                                            offline_delta = now - ref_time
+                                        except Exception:
+                                            offline_delta = timedelta(seconds=0)
+                                        if offline_delta >= timedelta(minutes=5):
+                                            changed_while_offline_long = True
+
+                                # Prepare embed with the new avatar image and timestamp and classification
+                                avatar_time = datetime.now(ZoneInfo("Europe/Lisbon"))
+                                avatar_time_str = avatar_time.strftime("%Y-%m-%d %H:%M")
+                                embed_avatar = discord.Embed(
+                                    title="🎭 [تغيير الأفاتار]",
+                                    description=f"اللاعب غيّر الأفاتار\nالتوقيت: {avatar_time_str} (Europe/Lisbon)",
+                                    color=0x9b59b6
+                                )
+                                embed_avatar.add_field(name="التوقيت", value=f"`{avatar_time_str}`", inline=True)
+
+                                if changed_while_offline_long:
+                                    offline_since = state.get("offline_since") or state.get("last_online_time")
+                                    if offline_since:
+                                        offline_since = _make_aware(offline_since)
+                                        offline_dur_secs = int((now - offline_since).total_seconds())
+                                        embed_avatar.add_field(name="الحالة أثناء التغيير", value=f"🔴 أوفلاين منذ **{format_seconds(offline_dur_secs)}**", inline=True)
+                                    else:
+                                        embed_avatar.add_field(name="الحالة أثناء التغيير", value="🔴 أوفلاين (مدة غير معروفة)", inline=True)
+                                else:
+                                    # Online now or recently online (<=5min)
+                                    if status in [1,2,3]:
+                                        embed_avatar.add_field(name="الحالة أثناء التغيير", value="🟢 أونلاين", inline=True)
+                                    else:
+                                        ref_time = state.get("offline_since") or state.get("last_online_time")
+                                        if ref_time:
+                                            ref_time = _make_aware(ref_time)
+                                            seconds_since = int((now - ref_time).total_seconds())
+                                            embed_avatar.add_field(name="الحالة أثناء التغيير", value=f"🟢 كان أونلاين قبل **{format_seconds(seconds_since)}**", inline=True)
+                                        else:
+                                            embed_avatar.add_field(name="الحالة أثناء التغيير", value="🟢 أونلاين (مؤكد)", inline=True)
+
+                                try:
+                                    if current_avatar_url:
+                                        embed_avatar.set_image(url=current_avatar_url)
+                                except Exception:
+                                    pass
+
+                                # Send to the dedicated avatar-change channel
+                                avatar_channel = bot.get_channel(AVATAR_CHANGE_CHANNEL_ID)
+                                if avatar_channel is None:
+                                    try:
+                                        avatar_channel = await bot.fetch_channel(AVATAR_CHANGE_CHANNEL_ID)
+                                    except Exception as e:
+                                        avatar_channel = None
+                                        print(f"Error fetching avatar channel: {e}")
+
+                                if avatar_channel:
+                                    try:
+                                        await avatar_channel.send(embed=embed_avatar)
+                                    except Exception as e:
+                                        print(f"Error sending avatar change embed: {e}")
+
+                                # If change happened while offline, also send the privacy-style alert to alert_channel
+                                if status == 0 and not state.get("privacy_alert_sent"):
+                                    embed_privacy = discord.Embed(
+                                        title="⚠️ [تحذير: تغيير الأفاتار أثناء الأوفلاين]",
+                                        description="يبدو أن الهدف غيّر الأفاتار وهو في وضع عدم الظهور، قد يكون مخفي أونلاين رغم ظهوره كأوفلاين.",
+                                        color=0xe74c3c
+                                    )
+                                    embed_privacy.add_field(name="⛔ الحالة الحالية", value="أوفلاين رسميًا لكن الأفاتار تغير", inline=False)
+                                    embed_privacy.add_field(name="🧠 معنى ذلك", value="ممكن يكون المستخدم مستخدم الوضع الخاص لإخفاء ظهور الأونلاين.", inline=False)
+                                    embed_privacy.add_field(name="🌐 رابط الأفاتار الجديد", value=current_avatar_url, inline=False)
+                                    try:
+                                        await alert_channel.send(embed=embed_privacy)
+                                    except Exception as e:
+                                        print(f"Error sending privacy embed: {e}")
+                                    state["privacy_alert_sent"] = True
+
+                                # Update stored avatar URL and hash and reset privacy flag if user is online
+                                state["last_avatar_url"] = current_avatar_url
+                                state["last_avatar_hash"] = current_avatar_hash
+                                if status != 0:
+                                    state["privacy_alert_sent"] = False
 
                     if state["pending_resume"] and state["pending_resume_leave_time"] and status != 2:
                         if now - state["pending_resume_leave_time"] > timedelta(minutes=10) and not state["session_recorded"]:
@@ -1502,6 +1887,61 @@ async def roblox_radar_loop():
                         state["last_online_time"] = now
                         state["offline_since"] = None
                         state["offline_notification_sent"] = False
+
+                        # Timeline: robust handling of resume/merge using 30-minute rule
+                        try:
+                            loff = state.get("timeline_last_offline_time")
+                            if loff:
+                                loff_aware = _make_aware(loff)
+                                if loff_aware is None:
+                                    loff_aware = loff
+                                delta = now - loff_aware
+                                if delta <= timedelta(minutes=30):
+                                    # Resumed within merge window -> continue the existing session
+                                    # Ensure we do NOT close or record the session; simply clear the offline marker
+                                    state["timeline_last_offline_time"] = None
+                                    # If session start was lost (e.g., restart), best-effort recovery:
+                                    if not state.get("timeline_current_session_start"):
+                                        # Attempt to recover start from DB for that date, else use loff_aware
+                                        try:
+                                            date_key = loff_aware.strftime("%Y-%m-%d")
+                                            doc = daily_timeline_collection.find_one({"_id": date_key}) or {}
+                                            sessions = doc.get("sessions", [])
+                                            if sessions:
+                                                # pick the last session whose end is <= loff_aware, if any
+                                                cand = None
+                                                for s in sessions:
+                                                    try:
+                                                        sed = s.get("end_time")
+                                                        sed_a = _make_aware(sed) if sed else None
+                                                        if sed_a and sed_a <= loff_aware:
+                                                            if not cand or sed_a > _make_aware(cand.get("end_time")):
+                                                                cand = s
+                                                    except Exception:
+                                                        continue
+                                                if cand and cand.get("start_time"):
+                                                    state["timeline_current_session_start"] = _make_aware(cand.get("start_time"))
+                                                else:
+                                                    state["timeline_current_session_start"] = loff_aware
+                                            else:
+                                                state["timeline_current_session_start"] = loff_aware
+                                        except Exception:
+                                            state["timeline_current_session_start"] = loff_aware
+                                else:
+                                    # Offline exceeded merge threshold -> close previous session if present, then start a new one
+                                    try:
+                                        if state.get("timeline_current_session_start"):
+                                            record_timeline_session(_make_aware(state.get("timeline_current_session_start")), loff_aware)
+                                    except Exception as e:
+                                        print(f"Error recording timeline on resume path: {e}")
+                                    state["timeline_current_session_start"] = now
+                                    state["timeline_last_offline_time"] = None
+                            else:
+                                # No offline marker -> if there's no current session, start one
+                                if not state.get("timeline_current_session_start"):
+                                    state["timeline_current_session_start"] = now
+                        except Exception:
+                            pass
                     elif previous_status in [1, 2, 3]:
                         pass
 
@@ -1603,6 +2043,35 @@ async def roblox_radar_loop():
                     if status == 0 and state["status"] != 0:
                         state["offline_since"] = now
                         state["offline_alert_sent"] = False
+
+                    # Timeline: mark offline time and possibly close session after 30 minutes
+                    if status == 0:
+                        try:
+                            # If there's no active timeline session, clear any stale last_offline_time
+                            if not state.get("timeline_current_session_start") and state.get("timeline_last_offline_time"):
+                                state["timeline_last_offline_time"] = None
+
+                            # set last_offline_time if not already
+                            if state.get("timeline_current_session_start") and not state.get("timeline_last_offline_time"):
+                                state["timeline_last_offline_time"] = now
+
+                            # if offline exceeded merge threshold, record the session and clear markers
+                            loff = state.get("timeline_last_offline_time")
+                            if state.get("timeline_current_session_start") and loff:
+                                loff_a = _make_aware(loff)
+                                if loff_a is None:
+                                    loff_a = loff
+                                if (now - loff_a) >= timedelta(minutes=30):
+                                    try:
+                                        record_timeline_session(_make_aware(state.get("timeline_current_session_start")), loff_a)
+                                    except Exception as e:
+                                        print(f"Error recording timeline on offline threshold: {e}")
+                                    # After closing/merging, always clear the offline marker to avoid stale values
+                                    state["timeline_current_session_start"] = None
+                                    state["timeline_last_offline_time"] = None
+                                    save_state_data()
+                        except Exception:
+                            pass
 
                     # إشعار 10 دقائق - إخباري فقط (لا يؤثر على الجلسة)
                     if status == 0 and state["offline_since"] and not state["offline_alert_sent"]:
