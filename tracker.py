@@ -34,6 +34,7 @@ WEEKLY_SUMMARY_CHANNEL_ID = 1510275621316595802
 DETAIL_CHANNEL_ID = 1510541538445230080
 AVATAR_CHANGE_CHANNEL_ID = 1510752801196871850
 TIMELINE_CHANNEL_ID = 1510754643414876301
+PRECISE_STATS_CHANNEL_ID = 1510936751252832288
 
 # ==================== MongoDB Configuration ====================
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://marwangamer056_db_user:NulNLKsdAz55Av50@cluster0.j35ail6.mongodb.net/?appName=Cluster0")
@@ -229,12 +230,14 @@ def sanitize_game_key(game_name):
 
 
 def log_session_entry(game_name, place_id, start_time, end_time, date_key=None):
-    if not game_name or not place_id or not start_time or not end_time or end_time <= start_time:
+    # allow missing place_id (store None) so we don't drop session logs
+    if not game_name or not start_time or not end_time or end_time <= start_time:
         return
+    place_id_str = str(place_id) if place_id else None
     session_logs.insert_one(
         {
             "game_name": game_name,
-            "place_id": str(place_id),
+            "place_id": place_id_str,
             "start_time": start_time,
             "end_time": end_time,
             "duration_seconds": int((end_time - start_time).total_seconds()),
@@ -279,28 +282,76 @@ def get_logical_day_close_deadline(now=None):
 
     midnight = datetime.combine(now.date(), dt_time.min, tzinfo=ZoneInfo("Europe/Lisbon"))
     last_activity = state.get("last_activity_time")
+    # If there was activity after midnight, use 2-hour grace after last activity.
+    # If there was NO activity after midnight (player was already offline at midnight),
+    # use a 4-hour midnight waiting window (00:00 - 04:00) before closing the logical day.
     if last_activity:
         last_activity = _make_aware(last_activity)
         if last_activity >= midnight:
             return last_activity + timedelta(hours=2)
-    return midnight + timedelta(hours=2)
+        else:
+            return midnight + timedelta(hours=4)
+    # No last_activity recorded — fall back to 4-hour midnight window
+    return midnight + timedelta(hours=4)
 
 
 def update_daily_online(start_dt, end_dt, date_key=None):
-    if not start_dt or not end_dt or end_dt <= start_dt:
-        return
+    # If a date_key is provided, compute online_seconds from the authoritative
+    # timeline documents (daily_timeline_collection) clipped to the logical-day
+    # interval (and optional end time). This avoids counting waiting/grace windows
+    # or long offline gaps when `online_session_start` spans multiple online/offline segments.
     if date_key:
-        seconds = int((end_dt - start_dt).total_seconds())
-        daily_stats_collection.update_one(
-            {"_id": date_key},
-            {
-                "$inc": {"online_seconds": seconds, "total_game_seconds": 0},
-                "$setOnInsert": {"games": {}, "last_updated": datetime.now(ZoneInfo("Europe/Lisbon"))}
-            },
-            upsert=True
-        )
+        try:
+            tz = ZoneInfo("Europe/Lisbon")
+            # Determine clipping end: prefer end_dt if provided and valid, else
+            # use any stored logical_close_at in daily_stats, else calendar day end
+            clip_end = None
+            if end_dt:
+                clip_end = end_dt
+            else:
+                doc = daily_stats_collection.find_one({"_id": date_key}) or {}
+                lc = doc.get("logical_close_at")
+                if lc:
+                    clip_end = _make_aware(lc)
+
+            # compute day start and default day end if clip_end not set
+            day = datetime.strptime(date_key, "%Y-%m-%d").date()
+            day_start = datetime.combine(day, dt_time.min, tzinfo=tz)
+            day_end_default = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
+            day_end = clip_end if clip_end else day_end_default
+
+            # Aggregate from timeline docs for the date and next date
+            total = 0
+            for d_key in [date_key, (day + timedelta(days=1)).strftime("%Y-%m-%d")]:
+                doc = daily_timeline_collection.find_one({"_id": d_key}) or {}
+                for s in doc.get("sessions", []):
+                    try:
+                        st = _make_aware(s.get("start_time"))
+                        ed_raw = s.get("end_time")
+                        ed = _make_aware(ed_raw) if ed_raw else None
+                        seg_start = st if st and st >= day_start else day_start
+                        seg_end = ed if ed and ed <= day_end else day_end
+                        if seg_end and seg_start and seg_end > seg_start:
+                            total += int((seg_end - seg_start).total_seconds())
+                    except Exception:
+                        continue
+
+            now_ts = datetime.now(ZoneInfo("Europe/Lisbon"))
+            daily_stats_collection.update_one(
+                {"_id": date_key},
+                {
+                    "$set": {"online_seconds": int(total), "last_updated": now_ts},
+                    "$setOnInsert": {"games": {}, "created_at": now_ts}
+                },
+                upsert=True
+            )
+        except Exception as e:
+            print(f"Error computing online from timeline for {date_key}: {e}")
         return
 
+    # Backward-compatible: if no date_key (rare), fall back to splitting by calendar dates
+    if not start_dt or not end_dt or end_dt <= start_dt:
+        return
     parts = split_duration_by_date(start_dt, end_dt)
     for date_key, seconds in parts.items():
         daily_stats_collection.update_one(
@@ -314,16 +365,21 @@ def update_daily_online(start_dt, end_dt, date_key=None):
 
 
 def update_daily_game(place_id, game_name, seconds, date_key=None):
-    if not place_id or not game_name or seconds <= 0:
+    # allow missing place_id (store None) to avoid dropping game stats
+    if not game_name or seconds <= 0:
         return
     now = datetime.now(ZoneInfo("Europe/Lisbon"))
     game_key = sanitize_game_key(game_name)
     date_key = date_key or get_date_str(now)
+    place_id_str = str(place_id) if place_id else None
+    # Build update dict; set place_id (possibly None) if provided
+    set_fields = {f"games.{game_key}.name": game_name, "last_updated": now}
+    set_fields[f"games.{game_key}.place_id"] = place_id_str
     daily_stats_collection.update_one(
         {"_id": date_key},
         {
             "$inc": {f"games.{game_key}.total_time": seconds, f"games.{game_key}.sessions": 1, "total_game_seconds": seconds},
-            "$set": {f"games.{game_key}.name": game_name, f"games.{game_key}.place_id": str(place_id), "last_updated": now}
+            "$set": set_fields
         },
         upsert=True
     )
@@ -593,100 +649,141 @@ def build_weekly_summary_embed():
 def build_detail_embeds(date_key):
     """بناء قائمة embeds بتفاصيل الجلسات ليوم محدد"""
     # Query session_logs
-    sessions = list(session_logs.find({"date_key": date_key}).sort("start_time", 1))
-    
+    raw_sessions = list(session_logs.find({"date_key": date_key}).sort("start_time", 1))
+
     # Query avatar changes first (needed for both cases)
     daily_doc = daily_stats_collection.find_one({"_id": date_key}) or {}
     avatar_changes = daily_doc.get("avatar_changes", 0)
-    
-    if not sessions:
-        # No sessions - return single embed with avatar_changes field
-        date_display = datetime.strptime(date_key, "%Y-%m-%d").strftime("%d/%m/%Y")
+
+    date_display = datetime.strptime(date_key, "%Y-%m-%d").strftime("%d/%m/%Y")
+
+    # If no sessions, return a simple embed
+    if not raw_sessions:
         embed = discord.Embed(
             title=f"📋 تفاصيل يوم {date_display}",
             description="لا توجد جلسات مسجلة لهذا اليوم",
             color=0x3498db
         )
         if avatar_changes > 0:
-            embed.add_field(
-                name="🎭 تغييرات الأفاتار",
-                value=f"**{avatar_changes} مرة**",
-                inline=False
-            )
+            embed.add_field(name="🎭 تغييرات الأفاتار", value=f"**{avatar_changes} مرة**", inline=False)
         else:
-            embed.add_field(
-                name="🎭 تغييرات الأفاتار",
-                value="لم يتغير الأفاتار اليوم",
-                inline=False
-            )
+            embed.add_field(name="🎭 تغييرات الأفاتار", value="لم يتغير الأفاتار اليوم", inline=False)
         embed.set_footer(text="تقرير تفصيلي كامل لكل جلسات اليوم")
         return [embed]
-    
-    # Build embeds with max 20 session fields per embed
+
+    # Normalize sessions (ensure aware datetimes) and prepare for merging
+    processed = []
+    for s in raw_sessions:
+        st_raw = s.get("start_time")
+        ed_raw = s.get("end_time")
+        try:
+            st = _make_aware(st_raw) if st_raw else None
+        except Exception:
+            st = None
+        try:
+            ed = _make_aware(ed_raw) if ed_raw else None
+        except Exception:
+            ed = None
+
+        duration = s.get("duration_seconds")
+        if (not duration or duration <= 0) and st and ed:
+            duration = int((ed - st).total_seconds())
+
+        processed.append({
+            "game_name": s.get("game_name", "Unknown"),
+            "place_id": s.get("place_id"),
+            "start_time": st,
+            "end_time": ed,
+            "duration_seconds": duration or 0
+        })
+
+    # Merge short gaps (<5 minutes) for the SAME map/place_id only (display-only)
+    display_sessions = []
+    for s in processed:
+        if not display_sessions:
+            display_sessions.append(s.copy())
+            continue
+
+        last = display_sessions[-1]
+        try:
+            # Use normalized game name as primary key for display merging
+            g1 = sanitize_game_key(s.get("game_name") or "")
+            g2 = sanitize_game_key(last.get("game_name") or "")
+            same_map = (g1 and g2 and g1 == g2)
+        except Exception:
+            same_map = False
+
+        if same_map and last.get("end_time") and s.get("start_time"):
+            gap = s.get("start_time") - last.get("end_time")
+            if gap <= timedelta(minutes=5):
+                # Merge into last
+                new_end = s.get("end_time") or last.get("end_time")
+                if new_end and last.get("start_time"):
+                    last["end_time"] = new_end
+                    last["duration_seconds"] = int((new_end - last.get("start_time")).total_seconds())
+                else:
+                    # Fallback: extend duration by sum
+                    last["duration_seconds"] = (last.get("duration_seconds", 0) + s.get("duration_seconds", 0))
+                continue
+
+        # Otherwise, append as separate display session
+        display_sessions.append(s.copy())
+
+    # Build embeds with max 20 session fields per embed, formatting times in 12-hour format
     embeds = []
-    date_display = datetime.strptime(date_key, "%Y-%m-%d").strftime("%d/%m/%Y")
     fields_added = 0
-    current_embed = discord.Embed(
-        title=f"📋 تفاصيل يوم {date_display}",
-        color=0x3498db
-    )
-    
-    total_sessions = len(sessions)
-    for idx, session in enumerate(sessions, start=1):
+    current_embed = discord.Embed(title=f"📋 تفاصيل يوم {date_display}", color=0x3498db)
+
+    total_sessions = len(display_sessions)
+    for idx, session in enumerate(display_sessions, start=1):
         game_name = session.get("game_name", "Unknown")
         start_time = session.get("start_time")
         end_time = session.get("end_time")
         duration_seconds = session.get("duration_seconds", 0)
-        
+
         if start_time and end_time:
-            start_str = start_time.strftime("%H:%M:%S")
-            end_str = end_time.strftime("%H:%M:%S")
+            try:
+                start_str = start_time.strftime("%I:%M %p")
+                end_str = end_time.strftime("%I:%M %p")
+            except Exception:
+                start_str = str(start_time)
+                end_str = str(end_time)
         else:
             start_str = "Unknown"
             end_str = "Unknown"
-        
+
         field_name = f"🎮 {game_name}"
         field_value = f"🕒 من {start_str} لحد {end_str}\n⏱️ مدة: {format_seconds(duration_seconds)}"
         current_embed.add_field(name=field_name, value=field_value, inline=False)
         fields_added += 1
-        
+
         # If we've added 20 fields and there are more sessions to add, create a new embed
         if fields_added >= 20 and idx != total_sessions:
             embeds.append(current_embed)
-            current_embed = discord.Embed(
-                title=f"📋 تفاصيل يوم {date_display} (متابعة)",
-                color=0x3498db
-            )
+            current_embed = discord.Embed(title=f"📋 تفاصيل يوم {date_display} (متابعة)", color=0x3498db)
             fields_added = 0
-    
+
     # Add avatar changes field to the last embed
     if avatar_changes > 0:
-        current_embed.add_field(
-            name="🎭 تغييرات الأفاتار",
-            value=f"**{avatar_changes} مرة**",
-            inline=False
-        )
+        current_embed.add_field(name="🎭 تغييرات الأفاتار", value=f"**{avatar_changes} مرة**", inline=False)
     else:
-        current_embed.add_field(
-            name="🎭 تغييرات الأفاتار",
-            value="لم يتغير الأفاتار اليوم",
-            inline=False
-        )
-    
+        current_embed.add_field(name="🎭 تغييرات الأفاتار", value="لم يتغير الأفاتار اليوم", inline=False)
+
     current_embed.set_footer(text="تقرير تفصيلي كامل لكل جلسات اليوم")
     embeds.append(current_embed)
-    
+
     return embeds
 
 
 def record_game_session(place_id, game_name, duration_seconds, start_time=None, force_date=None):
     """تسجيل جلسة لعب جديدة"""
-    if not place_id or not game_name or duration_seconds <= 0:
+    # allow missing place_id (store None) to avoid missing sessions when presence lacks placeId
+    if not game_name or duration_seconds <= 0:
         return
-    
+
     stats = load_games_stats()
     game_key = sanitize_game_key(game_name)
-    place_id_str = str(place_id)
+    place_id_str = str(place_id) if place_id else None
     
     if game_key not in stats:
         stats[game_key] = {
@@ -803,9 +900,33 @@ async def on_ready():
 
 @bot.check
 async def check_channel(ctx):
-    if ctx.command and ctx.command.name == "detail":
-        return ctx.channel.id in [CMD_CHANNEL_ID, DETAIL_CHANNEL_ID]
+    # Allow `detail` in both CMD and DETAIL channels, `timeline` only in TIMELINE channel
+    if ctx.command:
+        if ctx.command.name == "detail":
+            return ctx.channel.id in [CMD_CHANNEL_ID, DETAIL_CHANNEL_ID]
+        if ctx.command.name == "timeline":
+            return ctx.channel.id == TIMELINE_CHANNEL_ID
     return ctx.channel.id == CMD_CHANNEL_ID
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    # Provide clear feedback when a command is blocked by the channel check
+    if isinstance(error, commands.CheckFailure):
+        if ctx.command:
+            if ctx.command.name == "timeline":
+                await ctx.send("❌ هذا الأمر مسموح فقط في قناة سجل الأونلاين اليومية.")
+                return
+            if ctx.command.name == "precisestats":
+                await ctx.send("❌ هذا الأمر مسموح فقط في قناة إحصائيات الدقة.")
+                return
+            if ctx.command.name == "detail":
+                await ctx.send("❌ هذا الأمر مسموح فقط في قنوات الأوامر أو التفاصيل.")
+                return
+        await ctx.send("❌ لا تملك صلاحية استخدام هذا الأمر في هذه القناة.")
+        return
+    # For other errors, fall back to printing to console and allow default handling
+    print(f"Command error: {error}")
 
 # --- الأوامر التفاعلية ---
 
@@ -908,7 +1029,7 @@ async def cmd_last_seen(ctx):
         
         if state["last_online_time"]:
             # عرض التاريخ والوقت بالتفصيل
-            exact_time = state["last_online_time"].strftime("%Y-%m-%d %H:%M:%S")
+            exact_time = state["last_online_time"].strftime("%Y-%m-%d %I:%M:%S %p")
             embed = discord.Embed(
                 title="🔴 الشخص أوفلاين",
                 description=f"آخر مرة تُرصد اتصال: {time_str}",
@@ -1229,14 +1350,14 @@ async def cmd_what(ctx):
     """عرض الوقت والتاريخ الحالي بتوقيت Europe/Lisbon"""
     now = datetime.now(ZoneInfo("Europe/Lisbon"))
     date_str = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H:%M:%S")
+    time_str = now.strftime("%I:%M:%S %p")
     tz_info = "Europe/Lisbon"
     logical_day = get_active_report_date()
     logical_state = state.get("logical_day_key")
     last_act = state.get("last_activity_time")
     if last_act:
         last_act = _make_aware(last_act)
-        last_act_str = last_act.strftime("%Y-%m-%d %H:%M:%S")
+        last_act_str = last_act.strftime("%Y-%m-%d %I:%M:%S %p")
     else:
         last_act_str = "لا توجد بيانات"
 
@@ -1368,38 +1489,103 @@ def record_timeline_session(start_dt, end_dt):
 
 
 def build_daily_timeline_embeds(date_key, include_open_session=False):
-    """Build embeds for a given calendar date. If include_open_session=True, include any current open session (to Now).
-    date_key must be YYYY-MM-DD."""
-    doc = daily_timeline_collection.find_one({"_id": date_key}) or {}
-    sessions = list(doc.get("sessions", []))
-    total_online = doc.get("total_online_seconds", 0) or 0
-    date_display = datetime.strptime(date_key, "%Y-%m-%d").strftime("%d/%m/%Y")
+    """Build embeds for a given logical date_key (YYYY-MM-DD).
+    This will aggregate sessions from the calendar date document and the next calendar date,
+    then clip/merge them to the logical-day interval for `date_key`.
+    If include_open_session=True, include any current open session portion up to Now.
+    """
+    tz = ZoneInfo("Europe/Lisbon")
+    try:
+        day = datetime.strptime(date_key, "%Y-%m-%d").date()
+    except Exception:
+        date_key = get_active_report_date()
+        day = datetime.strptime(date_key, "%Y-%m-%d").date()
 
-    # If there's an open session that started today (or earlier but continues), add a synthetic session
-    now = datetime.now(ZoneInfo("Europe/Lisbon"))
-    added_open = False
+    day_start = datetime.combine(day, dt_time.min, tzinfo=tz)
+    now = datetime.now(tz)
+    # Determine logical-day end: if active day, use now; otherwise check stored logical_close_at
+    if state.get("logical_day_key") == date_key:
+        day_end = now
+    else:
+        # If this logical day was previously closed, use persisted close timestamp
+        stats_doc = daily_stats_collection.find_one({"_id": date_key}) or {}
+        lc = stats_doc.get("logical_close_at")
+        if lc:
+            day_end = _make_aware(lc)
+        else:
+            day_end = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
+
+    date_display = day.strftime("%d/%m/%Y")
+
+    sessions = []
+    total_online = 0
+
+    def process_doc(doc):
+        nonlocal sessions, total_online
+        for s in doc.get("sessions", []):
+            try:
+                st = _make_aware(s.get("start_time"))
+                ed_raw = s.get("end_time")
+                ed = _make_aware(ed_raw) if ed_raw else None
+
+                # Clip to logical-day interval
+                seg_start = st if st and st >= day_start else day_start
+                seg_end = ed if ed and ed <= day_end else (day_end if ed else (now if state.get("logical_day_key") == date_key else None))
+                if seg_end is None:
+                    # no valid end for historical closed day -> skip
+                    continue
+                if seg_end <= seg_start:
+                    continue
+                dur = int((seg_end - seg_start).total_seconds())
+                total_online += dur
+                # Mark as open if original had no end and we're including up-to-now
+                is_open = (ed_raw is None) and (state.get("logical_day_key") == date_key)
+                sessions.append({"start_time": seg_start, "end_time": (None if is_open else seg_end), "duration_seconds": dur})
+            except Exception:
+                continue
+
+    # Load calendar docs for the day and the next calendar day (to capture early-morning segments)
+    doc1 = daily_timeline_collection.find_one({"_id": date_key}) or {}
+    doc2 = daily_timeline_collection.find_one({"_id": (day + timedelta(days=1)).strftime("%Y-%m-%d")}) or {}
+    process_doc(doc1)
+    process_doc(doc2)
+
+    # Optionally include any current open session portion overlapping this logical day
     if include_open_session and state.get("timeline_current_session_start"):
         try:
             start = _make_aware(state.get("timeline_current_session_start"))
-            # Only include the portion for this calendar date
-            day_start = datetime.combine(datetime.strptime(date_key, "%Y-%m-%d").date(), dt_time.min, tzinfo=ZoneInfo("Europe/Lisbon"))
             seg_start = start if start >= day_start else day_start
-            # Determine if session should be considered open relative to now (within merge window or online)
-            loff = state.get("timeline_last_offline_time")
-            include_now = False
-            if state.get("status") in [1,2,3]:
-                include_now = True
-            elif loff:
-                loff = _make_aware(loff)
-                if (now - loff) < timedelta(minutes=30):
-                    include_now = True
 
-            if include_now and seg_start < now:
-                dur = int((now - seg_start).total_seconds())
-                # Append a synthetic session entry (end_time=None to indicate 'Now')
-                sessions.append({"start_time": seg_start, "end_time": None, "duration_seconds": dur, "_open": True})
-                total_online += dur
-                added_open = True
+            include_now = False
+            if state.get("status") in [1, 2, 3]:
+                include_now = True
+            else:
+                loff = state.get("timeline_last_offline_time")
+                if loff:
+                    loff_a = _make_aware(loff)
+                    if (now - loff_a) < timedelta(minutes=30):
+                        include_now = True
+
+            if include_now and seg_start < day_end:
+                # Determine seg_end carefully: if user is currently online, include up-to-now.
+                # If user is offline, do NOT include any time past the last known online instant
+                # (this prevents counting 2h/4h grace or waiting windows).
+                last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
+                if state.get("status") in [1, 2, 3]:
+                    seg_end = now if state.get("logical_day_key") == date_key else min(now, day_end)
+                    is_open = True
+                else:
+                    # offline: clip to last_online if available, otherwise skip including
+                    if last_online:
+                        seg_end = last_online if last_online <= day_end else day_end
+                    else:
+                        seg_end = None
+                    is_open = False
+
+                if seg_end and seg_end > seg_start:
+                    dur = int((seg_end - seg_start).total_seconds())
+                    total_online += dur
+                    sessions.append({"start_time": seg_start, "end_time": (None if is_open else seg_end), "duration_seconds": dur, "_open": is_open})
         except Exception:
             pass
 
@@ -1463,6 +1649,157 @@ async def send_daily_timeline(date_key):
         print(f"Error sending timeline embeds: {e}")
 
 
+def build_precise_stats_embed(date_key=None):
+    """Build precise real-time stats embed for a logical date_key.
+    Excludes any grace/wait windows; computes actual online time from timeline docs
+    and map sessions directly from `session_logs` (clipped to the logical-day interval).
+    """
+    tz = ZoneInfo("Europe/Lisbon")
+    date_key = date_key or get_active_report_date()
+    try:
+        day = datetime.strptime(date_key, "%Y-%m-%d").date()
+    except Exception:
+        day = datetime.now(tz).date()
+
+    day_start = datetime.combine(day, dt_time.min, tzinfo=tz)
+    # Determine logical-day end: if active day, use now; otherwise check persisted close
+    now = datetime.now(tz)
+    if state.get("logical_day_key") == date_key:
+        day_end = now
+    else:
+        stats_doc = daily_stats_collection.find_one({"_id": date_key}) or {}
+        lc = stats_doc.get("logical_close_at")
+        if lc:
+            day_end = _make_aware(lc)
+        else:
+            day_end = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
+
+    total_online = 0
+    # Aggregate timeline sessions from calendar documents covering this logical day
+    for d_key in [date_key, (day + timedelta(days=1)).strftime("%Y-%m-%d")]:
+        doc = daily_timeline_collection.find_one({"_id": d_key}) or {}
+        for s in doc.get("sessions", []):
+            try:
+                st = _make_aware(s.get("start_time"))
+                ed_raw = s.get("end_time")
+                ed = _make_aware(ed_raw) if ed_raw else None
+                if ed is None:
+                    # For open sessions include up-to-now only if this is active logical day
+                    if state.get("logical_day_key") == date_key:
+                        ed = now
+                    else:
+                        continue
+
+                seg_start = st if st and st >= day_start else day_start
+                seg_end = ed if ed and ed <= day_end else day_end
+                if seg_end and seg_start and seg_end > seg_start:
+                    total_online += int((seg_end - seg_start).total_seconds())
+            except Exception:
+                continue
+
+    # Include any current open timeline session portion (real-time) if it overlaps this logical day
+    try:
+        if state.get("timeline_current_session_start"):
+            tstart = _make_aware(state.get("timeline_current_session_start"))
+            loff = state.get("timeline_last_offline_time")
+            include_now = False
+            if state.get("status") in [1, 2, 3]:
+                include_now = True
+            elif loff:
+                loff_a = _make_aware(loff)
+                if (now - loff_a) < timedelta(minutes=30):
+                    include_now = True
+
+            if include_now:
+                seg_start = tstart if tstart and tstart >= day_start else day_start
+                # Prevent adding grace/wait windows: if offline, clip to last_online_time
+                last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
+                if state.get("status") in [1, 2, 3]:
+                    seg_end = now if state.get("logical_day_key") == date_key else min(now, day_end)
+                else:
+                    # offline: only include up to last known online instant (if within day)
+                    if last_online:
+                        seg_end = last_online if last_online <= day_end else day_end
+                    else:
+                        seg_end = None
+
+                if seg_end and seg_start and seg_end > seg_start:
+                    total_online += int((seg_end - seg_start).total_seconds())
+    except Exception:
+        pass
+
+    # Compute Inside Maps by scanning session_logs for overlaps and clipping
+    inside_seconds = 0
+    try:
+        cursor = session_logs.find({"start_time": {"$lt": day_end}, "end_time": {"$gt": day_start}})
+        for s in cursor:
+            try:
+                st = _make_aware(s.get("start_time"))
+                ed = _make_aware(s.get("end_time"))
+                if not st or not ed:
+                    continue
+                seg_start = st if st >= day_start else day_start
+                seg_end = ed if ed <= day_end else day_end
+                if seg_end > seg_start:
+                    place_id = s.get("place_id")
+                    if place_id:
+                        inside_seconds += int((seg_end - seg_start).total_seconds())
+            except Exception:
+                continue
+    except Exception:
+        inside_seconds = 0
+
+    # Include any current open game session (state) as inside time if applicable and place_id present
+    try:
+        if state.get("game_session_start") and state.get("place_id"):
+            gst = _make_aware(state.get("game_session_start"))
+            gseg_start = gst if gst and gst >= day_start else day_start
+            # If offline, clip to last_online_time to avoid counting grace/wait windows
+            last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
+            if state.get("logical_day_key") == date_key:
+                if state.get("status") in [1, 2, 3]:
+                    gseg_end = now
+                else:
+                    gseg_end = last_online
+            else:
+                gseg_end = min(now, day_end)
+
+            if gseg_end and gseg_end > day_end:
+                gseg_end = day_end
+
+            if gseg_end and gseg_start and gseg_end > gseg_start:
+                inside_seconds += int((gseg_end - gseg_start).total_seconds())
+    except Exception:
+        pass
+
+    outside_seconds = total_online - inside_seconds
+    if outside_seconds < 0:
+        outside_seconds = 0
+
+    date_display = day.strftime("%d/%m/%Y")
+    embed = discord.Embed(title=f"📈 Precise Stats — {date_display}", color=0x1abc9c)
+    embed.add_field(name="⛳ Inside Maps (real)", value=f"**{format_seconds(inside_seconds)}**", inline=False)
+    embed.add_field(name="🌐 Outside Maps (real)", value=f"**{format_seconds(outside_seconds)}**", inline=False)
+    embed.add_field(name="🕒 Total Online (real)", value=f"**{format_seconds(total_online)}**", inline=False)
+    embed.set_footer(text="Real-time metrics — excludes grace/wait windows")
+    return embed
+
+
+async def send_precise_stats(date_key=None):
+    channel = bot.get_channel(PRECISE_STATS_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(PRECISE_STATS_CHANNEL_ID)
+        except Exception as e:
+            print(f"Error fetching precise stats channel: {e}")
+            return
+    embed = build_precise_stats_embed(date_key)
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Error sending precise stats embed: {e}")
+
+
 @tasks.loop(time=dt_time(0, 0, 0, tzinfo=ZoneInfo("Europe/Lisbon")))
 async def daily_timeline_task():
     now = datetime.now(ZoneInfo("Europe/Lisbon"))
@@ -1493,8 +1830,8 @@ async def daily_timeline_task():
     except Exception as e:
         print(f"Error handling open timeline session at midnight: {e}")
 
-    # Send timeline for yesterday (date_key)
-    date_key = yesterday.strftime("%Y-%m-%d")
+    # Send timeline for the logical report date (align with daily summary / logical day)
+    date_key = get_active_report_date()
     await send_daily_timeline(date_key)
 
 
@@ -1508,15 +1845,62 @@ async def maybe_close_logical_day(now=None):
         return
 
     closed_day_key = state["logical_day_key"]
-    if state.get("online_session_start"):
-        update_daily_online(state["online_session_start"], now, date_key=closed_day_key)
-        state["online_session_start"] = None
+    # Use only the last known online timestamp as the end boundary.
+    # Do NOT use `now` as a fallback — that would include grace/wait windows.
+    end_time = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
+
+    # Prefer recording timeline using timeline_current_session_start; fallback to
+    # online_session_start if timeline marker is missing. Only record if we have
+    # a valid end_time (last known online instant).
+    try:
+        t_start_raw = state.get("timeline_current_session_start") or state.get("online_session_start")
+        if t_start_raw and end_time:
+            tstart = _make_aware(t_start_raw)
+            tend = end_time
+            if tstart and tend and tend > tstart:
+                record_timeline_session(tstart, tend)
+        # Clear timeline markers (we've persisted the final piece)
+        state["timeline_current_session_start"] = None
+        state["timeline_last_offline_time"] = None
+        save_state_data()
+    except Exception as e:
+        print(f"Error recording final timeline segment at close: {e}")
+
+    # If we have an end_time, rebuild the authoritative online_seconds for the closed
+    # logical day from the stored timeline (this ensures grace/wait windows never count).
+    if end_time and state.get("online_session_start"):
+        try:
+            # Recompute online seconds from timeline and persist into daily_stats
+            update_daily_online(state["online_session_start"], end_time, date_key=closed_day_key)
+            # Persist logical close time so historical timeline queries can clip properly
+            daily_stats_collection.update_one({"_id": closed_day_key}, {"$set": {"logical_close_at": end_time}}, upsert=True)
+        except Exception as e:
+            print(f"Error updating daily online from timeline at close: {e}")
+        finally:
+            state["online_session_start"] = None
+
+    # Determine whether this was a 2-hour grace (activity after midnight)
+    # or a 4-hour midnight waiting window (no activity after midnight)
+    midnight = datetime.combine(now.date(), dt_time.min, tzinfo=ZoneInfo("Europe/Lisbon"))
+    last_activity = state.get("last_activity_time")
+    grace_hours = 2
+    if last_activity:
+        la = _make_aware(last_activity)
+        if la < midnight:
+            grace_hours = 4
+    else:
+        grace_hours = 4
+
+    if grace_hours == 2:
+        desc_line = f"اللاعب بقي أوفلاين لمدة ساعتين بعد آخر نشاط بعد منتصف الليل.\n"
+    else:
+        desc_line = f"اللاعب لم يعد خلال نافذة الانتظار لمدة 4 ساعات بعد منتصف الليل.\n"
 
     embed = discord.Embed(
         title="🔴 [الهدف أوفلاين الآن - اليوم انتهى]",
         description=(
-            f"اللاعب بقي أوفلاين لمدة ساعتين بعد آخر نشاط بعد منتصف الليل.\n"
-            f"آخر نشاط: {state['last_activity_time'].strftime('%H:%M:%S') if state.get('last_activity_time') else 'Unknown'}\n\n"
+            desc_line +
+            f"آخر نشاط: {state['last_activity_time'].strftime('%I:%M:%S %p') if state.get('last_activity_time') else 'Unknown'}\n\n"
             "✅ اليوم السابق اتسجل وانتهى!"
         ),
         color=0x7f8c8d
@@ -1538,6 +1922,11 @@ async def maybe_close_logical_day(now=None):
 
     await send_daily_summary(closed_day_key)
     await send_daily_detail(closed_day_key)
+    # Send precise, real-time-only stats to the dedicated channel
+    try:
+        await send_precise_stats(closed_day_key)
+    except Exception as e:
+        print(f"Error sending precise stats: {e}")
 
     # Notify avatar change count for the closed logical day in the avatar channel
     try:
@@ -1647,14 +2036,38 @@ async def cmd_timeline(ctx):
         await ctx.send("❌ هذا الأمر مسموح فقط في قناة سجل الأونلاين اليومية.")
         return
 
-    now = datetime.now(ZoneInfo("Europe/Lisbon"))
-    date_key = now.strftime("%Y-%m-%d")
+    # Use logical day (same as daily summary / online today)
+    date_key = get_active_report_date()
     embeds = build_daily_timeline_embeds(date_key, include_open_session=True)
     try:
         for e in embeds:
             await ctx.send(embed=e)
     except Exception as e:
         await ctx.send(f"❌ خطأ أثناء إرسال التقرير: {e}")
+
+
+@bot.command(name="precisestats")
+async def cmd_precise_stats(ctx, date_arg: str = None):
+    """عرض تقرير الإحصائيات الدقيقة في القناة المخصصة (Real-time only)."""
+    if ctx.channel.id != PRECISE_STATS_CHANNEL_ID:
+        await ctx.send("❌ هذا الأمر مسموح فقط في قناة إحصائيات الدقة.")
+        return
+
+    if date_arg:
+        try:
+            datetime.strptime(date_arg, "%Y-%m-%d")
+            date_key = date_arg
+        except Exception:
+            await ctx.send("❌ تنسيق التاريخ غير صحيح. استخدم YYYY-MM-DD")
+            return
+    else:
+        date_key = get_active_report_date()
+
+    embed = build_precise_stats_embed(date_key)
+    try:
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"❌ خطأ أثناء إرسال الإحصائيات: {e}")
 
 @bot.command(name="topmap", aliases=["maptop", "mapstats"])
 async def cmd_top_map(ctx, period: str = "yesterday", date_arg: str = None):
@@ -1784,7 +2197,7 @@ async def roblox_radar_loop():
 
                                 # Prepare embed with the new avatar image and timestamp and classification
                                 avatar_time = datetime.now(ZoneInfo("Europe/Lisbon"))
-                                avatar_time_str = avatar_time.strftime("%Y-%m-%d %H:%M")
+                                avatar_time_str = avatar_time.strftime("%Y-%m-%d %I:%M %p")
                                 embed_avatar = discord.Embed(
                                     title="🎭 [تغيير الأفاتار]",
                                     description=f"اللاعب غيّر الأفاتار\nالتوقيت: {avatar_time_str} (Europe/Lisbon)",
@@ -1861,8 +2274,8 @@ async def roblox_radar_loop():
                             leave_duration = int((state["pending_resume_leave_time"] - state["game_session_start"]).total_seconds()) if state["game_session_start"] else 0
                             record_game_session(state["pending_resume_place_id"], state["pending_resume_game_name"], leave_duration, start_time=state["game_session_start"])
 
-                            start_time_str = state["game_session_start"].strftime("%H:%M:%S") if state["game_session_start"] else "Unknown"
-                            end_time_str = state["pending_resume_leave_time"].strftime("%H:%M:%S") if state["pending_resume_leave_time"] else "Unknown"
+                            start_time_str = state["game_session_start"].strftime("%I:%M:%S %p") if state["game_session_start"] else "Unknown"
+                            end_time_str = state["pending_resume_leave_time"].strftime("%I:%M:%S %p") if state["pending_resume_leave_time"] else "Unknown"
                             embed_recorded = discord.Embed(
                                 title="✅ [جلسة تم تسجيلها]",
                                 color=0x2ecc71
@@ -1961,11 +2374,11 @@ async def roblox_radar_loop():
                         state["offline_since"] = None
                         state["offline_notification_sent"] = False
 
-                    if status == 2 and previous_status == 2 and place_id != state["place_id"]:
+                    if status == 2 and previous_status == 2 and sanitize_game_key(game) != sanitize_game_key(state.get("last_game_name")):
                         # اللاعب غير اللعبة خلال حالة متصلة 2، اعتبر ذلك جلسة جديدة للماب الجديدة
                         if state["game_session_start"] and not state["session_recorded"]:
                             old_duration = int((now - state["game_session_start"]).total_seconds())
-                            record_game_session(state["place_id"], state["last_game_name"], old_duration, start_time=state["game_session_start"])
+                            record_game_session(state.get("place_id"), state.get("last_game_name"), old_duration, start_time=state["game_session_start"])
                         state["pending_resume"] = False
                         state["pending_resume_leave_time"] = None
                         state["last_game_name"] = game
@@ -1984,7 +2397,7 @@ async def roblox_radar_loop():
 
                     elif status == 2 and state["status"] != 2:
                         resumed_same_session = False
-                        if state["pending_resume"] and place_id == state["pending_resume_place_id"] and game == state["pending_resume_game_name"]:
+                        if state["pending_resume"] and sanitize_game_key(game) == sanitize_game_key(state.get("pending_resume_game_name")):
                             time_since_leave = now - state["pending_resume_leave_time"]
                             if time_since_leave <= timedelta(minutes=10):
                                 resumed_same_session = True
@@ -2036,7 +2449,7 @@ async def roblox_radar_loop():
                                 color=0xe67e22
                             )
                             embed_leave.add_field(name="اسم الماب", value=f"**{state['last_game_name']}**", inline=False)
-                            embed_leave.add_field(name="وقت الخروج", value=f"`{now.strftime('%Y-%m-%d %H:%M:%S')}`", inline=False)
+                            embed_leave.add_field(name="وقت الخروج", value=f"`{now.strftime('%Y-%m-%d %I:%M:%S %p')}`", inline=False)
                             embed_leave.add_field(name="ملاحظة", value="لو رجع نفس الماب خلال 10 دقائق، الجلسة ستحسب كجلسة واحدة.", inline=False)
                             await alert_channel.send(embed=embed_leave)
 
@@ -2084,33 +2497,7 @@ async def roblox_radar_loop():
                             await alert_channel.send(embed=embed)
                             state["offline_alert_sent"] = True
 
-                    # النظام الذكي: انتظر ساعتين من آخر نشاط قبل إنهاء اليوم
-                    if status == 0 and state["last_activity_time"] and not state["offline_notification_sent"]:
-                        deadline = get_logical_day_close_deadline(now)
-                        if deadline and now >= deadline:
-                            # حفظ الجلسة الحالية ضمن اليوم المنطقي القديم
-                            if state["online_session_start"]:
-                                update_daily_online(state["online_session_start"], now, date_key=state.get("logical_day_key"))
-                                state["online_session_start"] = None
-                            
-                            embed = discord.Embed(
-                                title="🔴 [الهدف أوفلاين الآن - اليوم انتهى]",
-                                description=(
-                                    f"اللاعب بقي أوفلاين لمدة ساعتين بعد آخر نشاط بعد منتصف الليل.\\n"
-                                    f"آخر نشاط: {state['last_activity_time'].strftime('%H:%M:%S') if state.get('last_activity_time') else 'Unknown'}\\n\\n"
-                                    "✅ اليوم السابق اتسجل وانتهى!"
-                                ),
-                                color=0x7f8c8d
-                            )
-                            await alert_channel.send(embed=embed)
-                            await send_daily_summary(state.get("logical_day_key"))
-                            await send_daily_detail(state.get("logical_day_key"))
-                            state["logical_day_key"] = get_date_str(now)
-                            state["session_day_start"] = state["logical_day_key"]
-                            state["offline_notification_sent"] = True
-                            state["offline_since"] = None
-                            state["offline_alert_sent"] = False
-                            state["last_activity_time"] = None
+                    # Logical-day close handled by maybe_close_logical_day() called earlier in the loop
 
                     if status != state["status"]: state["status"] = status
                     if status == 2: state["game"] = game
