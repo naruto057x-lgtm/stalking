@@ -932,8 +932,9 @@ async def on_command_error(ctx, error):
 
 @bot.command(name="avatarc")
 async def cmd_avatarc(ctx):
-    """عدد تغييرات الأفاتار اليوم"""
-    report_date = get_active_report_date()
+    """عدد تغييرات الأفاتار اليوم (اليوم المنطقي)"""
+    # Use logical day key, not calendar date
+    report_date = state.get("logical_day_key") or get_active_report_date()
     doc = daily_stats_collection.find_one({"_id": report_date}) or {}
     count = doc.get("avatar_changes", 0)
     embed = discord.Embed(title="📊 [عداد الأفاتار - اليوم]", color=0x3498db)
@@ -1493,13 +1494,15 @@ def build_daily_timeline_embeds(date_key, include_open_session=False):
     This will aggregate sessions from the calendar date document and the next calendar date,
     then clip/merge them to the logical-day interval for `date_key`.
     If include_open_session=True, include any current open session portion up to Now.
+    The date_key passed is authoritative — do NOT override with calendar date.
     """
     tz = ZoneInfo("Europe/Lisbon")
     try:
         day = datetime.strptime(date_key, "%Y-%m-%d").date()
     except Exception:
-        date_key = get_active_report_date()
-        day = datetime.strptime(date_key, "%Y-%m-%d").date()
+        # If invalid date_key is passed, log error but use provided key as-is
+        print(f"Invalid date_key format: {date_key}")
+        raise
 
     day_start = datetime.combine(day, dt_time.min, tzinfo=tz)
     now = datetime.now(tz)
@@ -1545,10 +1548,18 @@ def build_daily_timeline_embeds(date_key, include_open_session=False):
                 continue
 
     # Load calendar docs for the day and the next calendar day (to capture early-morning segments)
+    # For logical day boundaries, we need both the start calendar day and next calendar day
+    # to handle sessions that cross midnight
     doc1 = daily_timeline_collection.find_one({"_id": date_key}) or {}
-    doc2 = daily_timeline_collection.find_one({"_id": (day + timedelta(days=1)).strftime("%Y-%m-%d")}) or {}
-    process_doc(doc1)
-    process_doc(doc2)
+    # Only load next calendar day if this is NOT a closed logical day
+    # (closed days have their segments already clipped and stored within the logical-day doc)
+    if state.get("logical_day_key") == date_key:
+        doc2 = daily_timeline_collection.find_one({"_id": (day + timedelta(days=1)).strftime("%Y-%m-%d")}) or {}
+        process_doc(doc1)
+        process_doc(doc2)
+    else:
+        # For historical/closed days, only load from the logical day's own document
+        process_doc(doc1)
 
     # Optionally include any current open session portion overlapping this logical day
     if include_open_session and state.get("timeline_current_session_start"):
@@ -1653,12 +1664,15 @@ def build_precise_stats_embed(date_key=None):
     """Build precise real-time stats embed for a logical date_key.
     Excludes any grace/wait windows; computes actual online time from timeline docs
     and map sessions directly from `session_logs` (clipped to the logical-day interval).
+    Always uses the logical day key, never auto-switches to calendar date.
     """
     tz = ZoneInfo("Europe/Lisbon")
-    date_key = date_key or get_active_report_date()
+    # Use logical day key for stats, not calendar date
+    date_key = date_key or state.get("logical_day_key") or get_active_report_date()
     try:
         day = datetime.strptime(date_key, "%Y-%m-%d").date()
     except Exception:
+        print(f"Invalid date_key format: {date_key}")
         day = datetime.now(tz).date()
 
     day_start = datetime.combine(day, dt_time.min, tzinfo=tz)
@@ -1676,7 +1690,13 @@ def build_precise_stats_embed(date_key=None):
 
     total_online = 0
     # Aggregate timeline sessions from calendar documents covering this logical day
-    for d_key in [date_key, (day + timedelta(days=1)).strftime("%Y-%m-%d")]:
+    # For active logical days, load both the day and next calendar day (midnight boundary)
+    # For closed logical days, only load from the logical day's own document
+    doc_keys = [date_key]
+    if state.get("logical_day_key") == date_key:
+        doc_keys.append((day + timedelta(days=1)).strftime("%Y-%m-%d"))
+    
+    for d_key in doc_keys:
         doc = daily_timeline_collection.find_one({"_id": d_key}) or {}
         for s in doc.get("sessions", []):
             try:
@@ -1831,7 +1851,8 @@ async def daily_timeline_task():
         print(f"Error handling open timeline session at midnight: {e}")
 
     # Send timeline for the logical report date (align with daily summary / logical day)
-    date_key = get_active_report_date()
+    # Use the actual logical day key, NOT the calendar date (which may have changed at midnight)
+    date_key = state.get("logical_day_key") or get_active_report_date()
     await send_daily_timeline(date_key)
 
 
@@ -1996,7 +2017,7 @@ async def cmd_online(ctx, period: str = "today", date_arg: str = None):
             return await ctx.send("❌ استخدم: `!online today`, `!online week`, `!online month`, أو `!online YYYY-MM-DD`")
     # For 'today' use logical day key instead of calendar date
     if query == "today":
-        date_key = get_active_report_date()
+        date_key = state.get("logical_day_key") or get_active_report_date()
         try:
             parsed = datetime.strptime(date_key, "%Y-%m-%d").date()
             start_date, end_date = parsed, parsed
@@ -2037,7 +2058,8 @@ async def cmd_timeline(ctx):
         return
 
     # Use logical day (same as daily summary / online today)
-    date_key = get_active_report_date()
+    # Always use the logical day key, never auto-switch to calendar date
+    date_key = state.get("logical_day_key") or get_active_report_date()
     embeds = build_daily_timeline_embeds(date_key, include_open_session=True)
     try:
         for e in embeds:
@@ -2061,7 +2083,8 @@ async def cmd_precise_stats(ctx, date_arg: str = None):
             await ctx.send("❌ تنسيق التاريخ غير صحيح. استخدم YYYY-MM-DD")
             return
     else:
-        date_key = get_active_report_date()
+        # Use logical day, not calendar date
+        date_key = state.get("logical_day_key") or get_active_report_date()
 
     embed = build_precise_stats_embed(date_key)
     try:
@@ -2080,7 +2103,7 @@ async def cmd_top_map(ctx, period: str = "yesterday", date_arg: str = None):
 
     # For 'today' use logical day if available
     if query == "today":
-        date_key = get_active_report_date()
+        date_key = state.get("logical_day_key") or get_active_report_date()
         try:
             parsed = datetime.strptime(date_key, "%Y-%m-%d").date()
             start_date, end_date = parsed, parsed
@@ -2174,8 +2197,9 @@ async def roblox_radar_loop():
                             if changed:
                                 # Increment daily avatar change counter (logical day)
                                 try:
+                                    logical_day = state.get("logical_day_key") or get_active_report_date()
                                     daily_stats_collection.update_one(
-                                        {"_id": get_active_report_date()},
+                                        {"_id": logical_day},
                                         {"$inc": {"avatar_changes": 1}},
                                         upsert=True
                                     )
