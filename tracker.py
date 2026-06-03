@@ -38,7 +38,7 @@ PRECISE_STATS_CHANNEL_ID = 1510936751252832288
 
 # ==================== MongoDB Configuration ====================
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://marwangamer056_db_user:NulNLKsdAz55Av50@cluster0.j35ail6.mongodb.net/?appName=Cluster0")
-INTERVAL = 60
+INTERVAL = 20
 # ============================================================
 
 intents = discord.Intents.default()
