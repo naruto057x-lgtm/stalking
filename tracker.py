@@ -320,9 +320,16 @@ def update_daily_online(start_dt, end_dt, date_key=None):
             day_end_default = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
             day_end = clip_end if clip_end else day_end_default
 
-            # Aggregate from timeline docs for the date and next date
+            # Aggregate from timeline docs for the date.
+            # Only include the next-day document for an active logical day,
+            # to avoid counting closed-day waiting/grace delays recorded after midnight.
+            active_day = state.get("logical_day_key") == date_key
+            doc_keys = [date_key]
+            if active_day:
+                doc_keys.append((day + timedelta(days=1)).strftime("%Y-%m-%d"))
+
             total = 0
-            for d_key in [date_key, (day + timedelta(days=1)).strftime("%Y-%m-%d")]:
+            for d_key in doc_keys:
                 doc = daily_timeline_collection.find_one({"_id": d_key}) or {}
                 for s in doc.get("sessions", []):
                     try:
@@ -362,6 +369,207 @@ def update_daily_online(start_dt, end_dt, date_key=None):
             },
             upsert=True
         )
+
+
+def compute_logical_day_timeline_total(date_key):
+    tz = ZoneInfo("Europe/Lisbon")
+    try:
+        day = datetime.strptime(date_key, "%Y-%m-%d").date()
+    except Exception:
+        return 0
+
+    day_start = datetime.combine(day, dt_time.min, tzinfo=tz)
+    stats_doc = daily_stats_collection.find_one({"_id": date_key}) or {}
+    logical_close_at = stats_doc.get("logical_close_at")
+    is_active = state.get("logical_day_key") == date_key
+    now = datetime.now(tz)
+    if is_active:
+        day_end = now
+    elif logical_close_at:
+        day_end = _make_aware(logical_close_at)
+    else:
+        day_end = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
+
+    doc_keys = [date_key]
+    if is_active:
+        doc_keys.append((day + timedelta(days=1)).strftime("%Y-%m-%d"))
+
+    total = 0
+    for d_key in doc_keys:
+        doc = daily_timeline_collection.find_one({"_id": d_key}) or {}
+        for s in doc.get("sessions", []):
+            try:
+                st = _make_aware(s.get("start_time"))
+                ed_raw = s.get("end_time")
+                ed = _make_aware(ed_raw) if ed_raw else None
+                if ed is None:
+                    if is_active:
+                        ed = now
+                    else:
+                        continue
+                seg_start = st if st and st >= day_start else day_start
+                seg_end = ed if ed and ed <= day_end else day_end
+                if seg_end and seg_start and seg_end > seg_start:
+                    total += int((seg_end - seg_start).total_seconds())
+            except Exception:
+                continue
+    return total
+
+
+def merge_segments(segments):
+    merged = []
+    for start, end in sorted(segments, key=lambda x: x[0]):
+        if not merged:
+            merged.append([start, end])
+            continue
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1][1] = max(last_end, end)
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]
+
+
+def get_logical_day_timeline_segments(date_key):
+    tz = ZoneInfo("Europe/Lisbon")
+    try:
+        day = datetime.strptime(date_key, "%Y-%m-%d").date()
+    except Exception:
+        return []
+
+    day_start = datetime.combine(day, dt_time.min, tzinfo=tz)
+    stats_doc = daily_stats_collection.find_one({"_id": date_key}) or {}
+    logical_close_at = stats_doc.get("logical_close_at")
+    is_active = state.get("logical_day_key") == date_key
+    now = datetime.now(tz)
+    if is_active:
+        day_end = now
+    elif logical_close_at:
+        day_end = _make_aware(logical_close_at)
+    else:
+        day_end = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
+
+    doc_keys = [date_key]
+    if is_active:
+        doc_keys.append((day + timedelta(days=1)).strftime("%Y-%m-%d"))
+
+    segments = []
+    for d_key in doc_keys:
+        doc = daily_timeline_collection.find_one({"_id": d_key}) or {}
+        for s in doc.get("sessions", []):
+            st = _make_aware(s.get("start_time"))
+            ed_raw = s.get("end_time")
+            ed = _make_aware(ed_raw) if ed_raw else None
+            if ed is None:
+                if is_active:
+                    ed = now
+                else:
+                    continue
+            seg_start = st if st and st >= day_start else day_start
+            seg_end = ed if ed and ed <= day_end else day_end
+            if seg_start and seg_end and seg_end > seg_start:
+                segments.append((seg_start, seg_end))
+
+    if is_active and state.get("timeline_current_session_start"):
+        try:
+            start = _make_aware(state.get("timeline_current_session_start"))
+            if start:
+                seg_start = start if start >= day_start else day_start
+                loff = state.get("timeline_last_offline_time")
+                include_now = False
+                if state.get("status") in [1, 2, 3]:
+                    include_now = True
+                elif loff:
+                    loff_a = _make_aware(loff)
+                    if loff_a and (now - loff_a) < timedelta(minutes=30):
+                        include_now = True
+
+                if include_now and seg_start < day_end:
+                    last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
+                    if state.get("status") in [1, 2, 3]:
+                        seg_end = min(now, day_end)
+                    else:
+                        seg_end = last_online if last_online and last_online <= day_end else None
+                    if seg_end and seg_end > seg_start:
+                        segments.append((seg_start, seg_end))
+        except Exception:
+            pass
+
+    return merge_segments(segments)
+
+
+def get_logical_day_inside_segments(date_key):
+    tz = ZoneInfo("Europe/Lisbon")
+    try:
+        day = datetime.strptime(date_key, "%Y-%m-%d").date()
+    except Exception:
+        return []
+
+    day_start = datetime.combine(day, dt_time.min, tzinfo=tz)
+    stats_doc = daily_stats_collection.find_one({"_id": date_key}) or {}
+    logical_close_at = stats_doc.get("logical_close_at")
+    is_active = state.get("logical_day_key") == date_key
+    now = datetime.now(tz)
+    if is_active:
+        day_end = now
+    elif logical_close_at:
+        day_end = _make_aware(logical_close_at)
+    else:
+        day_end = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
+
+    segments = []
+    try:
+        cursor = session_logs.find({"start_time": {"$lt": day_end}, "end_time": {"$gt": day_start}})
+        for s in cursor:
+            st = _make_aware(s.get("start_time"))
+            ed = _make_aware(s.get("end_time"))
+            if not st or not ed:
+                continue
+            seg_start = st if st >= day_start else day_start
+            seg_end = ed if ed <= day_end else day_end
+            if seg_start and seg_end and seg_end > seg_start:
+                segments.append((seg_start, seg_end))
+    except Exception:
+        pass
+
+    try:
+        if state.get("game_session_start"):
+            gst = _make_aware(state.get("game_session_start"))
+            if gst:
+                seg_start = gst if gst >= day_start else day_start
+                last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
+                if state.get("logical_day_key") == date_key:
+                    if state.get("status") in [1, 2, 3]:
+                        seg_end = min(now, day_end)
+                    else:
+                        seg_end = last_online if last_online and last_online <= day_end else None
+                else:
+                    seg_end = day_end
+                if seg_end and seg_end > seg_start:
+                    segments.append((seg_start, seg_end))
+    except Exception:
+        pass
+
+    return merge_segments(segments)
+
+
+def compute_segment_overlap(segments_a, segments_b):
+    a = merge_segments(segments_a)
+    b = merge_segments(segments_b)
+    i = j = 0
+    overlap = 0
+    while i < len(a) and j < len(b):
+        a_start, a_end = a[i]
+        b_start, b_end = b[j]
+        start = max(a_start, b_start)
+        end = min(a_end, b_end)
+        if start < end:
+            overlap += int((end - start).total_seconds())
+        if a_end <= b_end:
+            i += 1
+        else:
+            j += 1
+    return overlap
 
 
 def update_daily_game(place_id, game_name, seconds, date_key=None):
@@ -489,7 +697,7 @@ def get_new_friends_count(date_key):
 
 def build_daily_summary_embed(date_key):
     doc = daily_stats_collection.find_one({"_id": date_key}) or {}
-    total_online = doc.get("online_seconds", 0)
+    total_online = compute_logical_day_timeline_total(date_key)
     games = doc.get("games", {})
     total_maps = len(games)
     total_sessions = sum(game.get("sessions", 0) for game in games.values())
@@ -1688,110 +1896,11 @@ def build_precise_stats_embed(date_key=None):
         else:
             day_end = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
 
-    total_online = 0
-    # Aggregate timeline sessions from calendar documents covering this logical day
-    # For active logical days, load both the day and next calendar day (midnight boundary)
-    # For closed logical days, only load from the logical day's own document
-    doc_keys = [date_key]
-    if state.get("logical_day_key") == date_key:
-        doc_keys.append((day + timedelta(days=1)).strftime("%Y-%m-%d"))
-    
-    for d_key in doc_keys:
-        doc = daily_timeline_collection.find_one({"_id": d_key}) or {}
-        for s in doc.get("sessions", []):
-            try:
-                st = _make_aware(s.get("start_time"))
-                ed_raw = s.get("end_time")
-                ed = _make_aware(ed_raw) if ed_raw else None
-                if ed is None:
-                    # For open sessions include up-to-now only if this is active logical day
-                    if state.get("logical_day_key") == date_key:
-                        ed = now
-                    else:
-                        continue
+    timeline_segments = get_logical_day_timeline_segments(date_key)
+    total_online = sum(int((end - start).total_seconds()) for start, end in timeline_segments)
 
-                seg_start = st if st and st >= day_start else day_start
-                seg_end = ed if ed and ed <= day_end else day_end
-                if seg_end and seg_start and seg_end > seg_start:
-                    total_online += int((seg_end - seg_start).total_seconds())
-            except Exception:
-                continue
-
-    # Include any current open timeline session portion (real-time) if it overlaps this logical day
-    try:
-        if state.get("timeline_current_session_start"):
-            tstart = _make_aware(state.get("timeline_current_session_start"))
-            loff = state.get("timeline_last_offline_time")
-            include_now = False
-            if state.get("status") in [1, 2, 3]:
-                include_now = True
-            elif loff:
-                loff_a = _make_aware(loff)
-                if (now - loff_a) < timedelta(minutes=30):
-                    include_now = True
-
-            if include_now:
-                seg_start = tstart if tstart and tstart >= day_start else day_start
-                # Prevent adding grace/wait windows: if offline, clip to last_online_time
-                last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
-                if state.get("status") in [1, 2, 3]:
-                    seg_end = now if state.get("logical_day_key") == date_key else min(now, day_end)
-                else:
-                    # offline: only include up to last known online instant (if within day)
-                    if last_online:
-                        seg_end = last_online if last_online <= day_end else day_end
-                    else:
-                        seg_end = None
-
-                if seg_end and seg_start and seg_end > seg_start:
-                    total_online += int((seg_end - seg_start).total_seconds())
-    except Exception:
-        pass
-
-    # Compute Inside Maps by scanning session_logs for overlaps and clipping
-    inside_seconds = 0
-    try:
-        cursor = session_logs.find({"start_time": {"$lt": day_end}, "end_time": {"$gt": day_start}})
-        for s in cursor:
-            try:
-                st = _make_aware(s.get("start_time"))
-                ed = _make_aware(s.get("end_time"))
-                if not st or not ed:
-                    continue
-                seg_start = st if st >= day_start else day_start
-                seg_end = ed if ed <= day_end else day_end
-                if seg_end > seg_start:
-                    place_id = s.get("place_id")
-                    if place_id:
-                        inside_seconds += int((seg_end - seg_start).total_seconds())
-            except Exception:
-                continue
-    except Exception:
-        inside_seconds = 0
-
-    # Include any current open game session (state) as inside time if applicable and place_id present
-    try:
-        if state.get("game_session_start") and state.get("place_id"):
-            gst = _make_aware(state.get("game_session_start"))
-            gseg_start = gst if gst and gst >= day_start else day_start
-            # If offline, clip to last_online_time to avoid counting grace/wait windows
-            last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
-            if state.get("logical_day_key") == date_key:
-                if state.get("status") in [1, 2, 3]:
-                    gseg_end = now
-                else:
-                    gseg_end = last_online
-            else:
-                gseg_end = min(now, day_end)
-
-            if gseg_end and gseg_end > day_end:
-                gseg_end = day_end
-
-            if gseg_end and gseg_start and gseg_end > gseg_start:
-                inside_seconds += int((gseg_end - gseg_start).total_seconds())
-    except Exception:
-        pass
-
+    inside_segments = get_logical_day_inside_segments(date_key)
+    inside_seconds = compute_segment_overlap(timeline_segments, inside_segments)
     outside_seconds = total_online - inside_seconds
     if outside_seconds < 0:
         outside_seconds = 0
@@ -1820,6 +1929,39 @@ async def send_precise_stats(date_key=None):
         print(f"Error sending precise stats embed: {e}")
 
 
+def normalize_timeline_session_start_for_current_day(now=None):
+    now = now or datetime.now(ZoneInfo("Europe/Lisbon"))
+    if not state.get("timeline_current_session_start"):
+        return
+    start = _make_aware(state.get("timeline_current_session_start"))
+    if not start:
+        return
+    midnight = datetime.combine(now.date(), dt_time.min, tzinfo=ZoneInfo("Europe/Lisbon"))
+    if start >= midnight:
+        return
+
+    last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
+    loff = _make_aware(state.get("timeline_last_offline_time")) if state.get("timeline_last_offline_time") else None
+    record_end = midnight
+    if state.get("status") not in [1, 2, 3]:
+        # If offline now, prefer the last known valid online instant for closing the old session.
+        if last_online and last_online >= start and last_online <= midnight:
+            record_end = last_online
+        elif loff and loff > start and loff <= midnight:
+            record_end = loff
+
+    if record_end and record_end > start:
+        record_timeline_session(start, record_end)
+
+    if state.get("status") in [1, 2, 3]:
+        state["timeline_current_session_start"] = midnight
+        if loff and loff < midnight:
+            state["timeline_last_offline_time"] = None
+    else:
+        state["timeline_current_session_start"] = None
+        state["timeline_last_offline_time"] = None
+    save_state_data()
+
 @tasks.loop(time=dt_time(0, 0, 0, tzinfo=ZoneInfo("Europe/Lisbon")))
 async def daily_timeline_task():
     now = datetime.now(ZoneInfo("Europe/Lisbon"))
@@ -1831,21 +1973,26 @@ async def daily_timeline_task():
         if state.get("timeline_current_session_start"):
             start = _make_aware(state.get("timeline_current_session_start"))
             if start and start < midnight:
-                # record segment from start to midnight
-                record_timeline_session(start, midnight)
-                # if user still considered online or within 30min offline, continue session from midnight
-                if state.get("status") in [1,2,3]:
+                # If the user is offline at midnight, do not count the offline gap as online time.
+                # Close yesterday's segment at the last known online instant or the offline marker.
+                record_end = midnight
+                if state.get("status") not in [1, 2, 3]:
+                    last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
+                    loff = _make_aware(state.get("timeline_last_offline_time")) if state.get("timeline_last_offline_time") else None
+                    if last_online and last_online > start and last_online <= midnight:
+                        record_end = last_online
+                    elif loff and loff > start and loff <= midnight:
+                        record_end = loff
+
+                if record_end and record_end > start:
+                    record_timeline_session(start, record_end)
+
+                if state.get("status") in [1, 2, 3]:
                     state["timeline_current_session_start"] = midnight
                 else:
-                    # if offline but within 30 minutes since offline, continue
-                    loff = state.get("timeline_last_offline_time")
-                    if loff:
-                        loff = _make_aware(loff)
-                        if (midnight - loff) < timedelta(minutes=30):
-                            state["timeline_current_session_start"] = midnight
-                        else:
-                            state["timeline_current_session_start"] = None
-                            state["timeline_last_offline_time"] = None
+                    state["timeline_current_session_start"] = None
+                    # Preserve the offline marker for the merge window if the user resumes shortly after midnight.
+                    # Do not reset timeline_last_offline_time here; let the resume logic decide when to continue the session.
                 save_state_data()
     except Exception as e:
         print(f"Error handling open timeline session at midnight: {e}")
@@ -2068,6 +2215,318 @@ async def cmd_timeline(ctx):
         await ctx.send(f"❌ خطأ أثناء إرسال التقرير: {e}")
 
 
+@bot.command(name="debugonline")
+async def cmd_debug_online(ctx, date_arg: str = None):
+    """Diagnostic debug report for logical-day timeline/session totals."""
+    if date_arg is None:
+        await ctx.send("❌ استخدم: `!debugonline YYYY-MM-DD`")
+        return
+
+    try:
+        report_date = datetime.strptime(date_arg, "%Y-%m-%d").date()
+    except Exception:
+        await ctx.send("❌ تنسيق التاريخ غير صحيح. استخدم YYYY-MM-DD")
+        return
+
+    tz = ZoneInfo("Europe/Lisbon")
+    day_start = datetime.combine(report_date, dt_time.min, tzinfo=tz)
+    now = datetime.now(tz)
+    is_active_logical_day = state.get("logical_day_key") == date_arg
+
+    stats_doc = daily_stats_collection.find_one({"_id": date_arg}) or {}
+    logical_close_at = stats_doc.get("logical_close_at")
+    if is_active_logical_day:
+        day_end = now
+    elif logical_close_at:
+        day_end = _make_aware(logical_close_at)
+    else:
+        day_end = datetime.combine(report_date + timedelta(days=1), dt_time.min, tzinfo=tz)
+
+    # Load relevant timeline docs
+    docs = []
+    doc1 = daily_timeline_collection.find_one({"_id": date_arg})
+    if doc1:
+        docs.append(doc1)
+    if is_active_logical_day:
+        next_doc = daily_timeline_collection.find_one({"_id": (report_date + timedelta(days=1)).strftime("%Y-%m-%d")})
+        if next_doc:
+            docs.append(next_doc)
+
+    timeline_sessions = []
+    timeline_total = 0
+    timeline_warnings = []
+
+    def to_str(dt):
+        return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "None"
+
+    for doc in docs:
+        for s in doc.get("sessions", []):
+            st = _make_aware(s.get("start_time"))
+            ed_raw = s.get("end_time")
+            ed = _make_aware(ed_raw) if ed_raw else None
+            if ed is None:
+                if is_active_logical_day:
+                    ed = now
+                else:
+                    continue
+
+            seg_start = st if st and st >= day_start else day_start
+            seg_end = ed if ed and ed <= day_end else day_end
+            if not seg_start or not seg_end or seg_end <= seg_start:
+                timeline_warnings.append(f"Impossible timeline segment: start={to_str(st)} end={to_str(ed)}")
+                continue
+
+            duration = int((seg_end - seg_start).total_seconds())
+            if duration < 0 or duration > 86400:
+                timeline_warnings.append(f"Suspicious timeline duration {duration}s for {to_str(seg_start)} -> {to_str(seg_end)}")
+
+            timeline_sessions.append({
+                "start": seg_start,
+                "end": seg_end,
+                "duration": duration,
+                "source_doc": doc.get("_id")
+            })
+            timeline_total += duration
+
+    # Current open timeline portion if active day and applicable
+    open_session = None
+    if is_active_logical_day and state.get("timeline_current_session_start"):
+        tstart = _make_aware(state.get("timeline_current_session_start"))
+        loff = state.get("timeline_last_offline_time")
+        include_now = False
+        if state.get("status") in [1, 2, 3]:
+            include_now = True
+        elif loff:
+            loff_a = _make_aware(loff)
+            if (now - loff_a) < timedelta(minutes=30):
+                include_now = True
+
+        if include_now:
+            seg_start = tstart if tstart and tstart >= day_start else day_start
+            last_online = _make_aware(state.get("last_online_time")) if state.get("last_online_time") else None
+            if state.get("status") in [1, 2, 3]:
+                seg_end = now
+            else:
+                seg_end = last_online if last_online and last_online <= day_end else day_end if last_online else None
+
+            if seg_end and seg_end > seg_start:
+                open_session = {
+                    "start": seg_start,
+                    "end": seg_end,
+                    "duration": int((seg_end - seg_start).total_seconds())
+                }
+
+    precise_total = timeline_total + (open_session["duration"] if open_session else 0)
+
+    # Load session logs overlapping the logical day interval
+    log_cursor = session_logs.find({"start_time": {"$lt": day_end}, "end_time": {"$gt": day_start}})
+    session_log_records = []
+    session_logs_total = 0
+    session_logs_inside = 0
+    log_warnings = []
+
+    for s in log_cursor:
+        st = _make_aware(s.get("start_time"))
+        ed = _make_aware(s.get("end_time"))
+        if not st or not ed:
+            log_warnings.append(f"Invalid session log times: {s}")
+            continue
+
+        raw_duration = int((ed - st).total_seconds())
+        seg_start = st if st >= day_start else day_start
+        seg_end = ed if ed <= day_end else day_end
+        if seg_end <= seg_start:
+            log_warnings.append(f"Session log does not overlap day: {s.get('game_name')} {to_str(st)} -> {to_str(ed)}")
+            continue
+
+        clipped_duration = int((seg_end - seg_start).total_seconds())
+        session_logs_total += clipped_duration
+        if s.get("place_id") is not None:
+            session_logs_inside += clipped_duration
+
+        session_log_records.append({
+            "game_name": s.get("game_name"),
+            "place_id": s.get("place_id"),
+            "start": st,
+            "end": ed,
+            "raw_duration": raw_duration,
+            "clipped_duration": clipped_duration
+        })
+
+    session_logs_outside = precise_total - session_logs_inside
+    if session_logs_outside < 0:
+        session_logs_outside = 0
+
+    # Validate timeline sessions for overlaps/duplicates
+    timeline_sessions_sorted = sorted(timeline_sessions, key=lambda x: x["start"])
+    overlap_warnings = []
+    duplicate_warnings = []
+    seen_tuples = set()
+    prev_end = None
+    for sess in timeline_sessions_sorted:
+        key = (sess["start"], sess["end"], sess["duration"])
+        if key in seen_tuples:
+            duplicate_warnings.append(f"Duplicate timeline session: {to_str(sess['start'])} -> {to_str(sess['end'])} ({sess['duration']}s)")
+        seen_tuples.add(key)
+        if prev_end and sess["start"] < prev_end:
+            overlap_warnings.append(f"Overlap: {to_str(sess['start'])} starts before previous end {to_str(prev_end)}")
+        prev_end = sess["end"] if prev_end is None or sess["end"] > prev_end else prev_end
+
+    # Validate duplicated session logs
+    seen_logs = set()
+    duplicate_log_warnings = []
+    for rec in session_log_records:
+        key = (rec["game_name"], rec["place_id"], rec["start"], rec["end"], rec["clipped_duration"])
+        if key in seen_logs:
+            duplicate_log_warnings.append(f"Duplicate session log: {rec['game_name']} | {rec['place_id']} | {to_str(rec['start'])} -> {to_str(rec['end'])} ({rec['clipped_duration']}s)")
+        seen_logs.add(key)
+
+    warning_lines = []
+    warning_lines.extend(timeline_warnings)
+    warning_lines.extend(log_warnings)
+    warning_lines.extend(overlap_warnings)
+    warning_lines.extend(duplicate_warnings)
+    warning_lines.extend(duplicate_log_warnings)
+
+    # Build report
+    report_lines = [
+        f"=== DEBUG ONLINE REPORT for {date_arg} ===",
+        f"logical_day_key: {state.get('logical_day_key')}",
+        f"is_active_logical_day: {is_active_logical_day}",
+        f"date_key: {date_arg}",
+        f"day_start: {to_str(day_start)}",
+        f"day_end: {to_str(day_end)}",
+        "",
+        f"1. daily_timeline_collection docs: {len(docs)}",
+        f"2. Number of merged timeline sessions: {len(timeline_sessions)}",
+        f"3. Total duration from timeline sessions: {timeline_total}s ({format_seconds(timeline_total)})",
+        f"4. Timeline sessions:",
+    ]
+
+    timeline_lines = []
+    for idx, sess in enumerate(timeline_sessions_sorted, start=1):
+        timeline_lines.append(f"  {idx}. {to_str(sess['start'])} -> {to_str(sess['end'])} | {sess['duration']}s ({format_seconds(sess['duration'])}) | doc={sess['source_doc']}")
+    if open_session:
+        report_lines.append(f"   - open current session portion included: {open_session['duration']}s ({format_seconds(open_session['duration'])})")
+
+    summary_total = compute_logical_day_timeline_total(date_arg)
+    report_lines.extend([
+        "",
+        f"5. session_logs records overlapping day: {len(session_log_records)}",
+        f"6. Total clipped duration from session_logs: {session_logs_total}s ({format_seconds(session_logs_total)})",
+        f"7. Total clipped duration from session_logs with place_id != null (Inside Maps): {session_logs_inside}s ({format_seconds(session_logs_inside)})",
+        f"8. Session logs:",
+    ])
+
+    session_log_lines = []
+    for idx, rec in enumerate(session_log_records, start=1):
+        session_log_lines.append(
+            f"  {idx}. {rec['game_name']} | {rec['place_id']} | {to_str(rec['start'])} -> {to_str(rec['end'])} | raw={rec['raw_duration']}s clipped={rec['clipped_duration']}s"
+        )
+
+    report_lines.extend([
+        "",
+        f"9. daily_stats.online_seconds: {stats_doc.get('online_seconds')}",
+        f"10. daily_stats.games_time_seconds: {stats_doc.get('games_time_seconds')}",
+        f"11. daily_stats.session_count: {stats_doc.get('session_count')}",
+        f"12. daily_stats.logical_close_at: {to_str(_make_aware(logical_close_at)) if logical_close_at else 'None'}",
+        "",
+        f"13. date_key: {date_arg}",
+        "",
+        f"14. Precise Stats exact Total Online: {precise_total}s ({format_seconds(precise_total)})",
+        f"15. Exact Inside Maps: {session_logs_inside}s ({format_seconds(session_logs_inside)})",
+        f"16. Exact Outside Maps: {session_logs_outside}s ({format_seconds(session_logs_outside)})",
+        f"17. Outside = Total - Inside: {precise_total}s - {session_logs_inside}s = {session_logs_outside}s",
+        "",
+        "18. Timeline validation:",
+    ])
+
+    if overlap_warnings or duplicate_warnings:
+        report_lines.append(f"  Overlaps: {len(overlap_warnings)} | Duplicates: {len(duplicate_warnings)}")
+    else:
+        report_lines.append("  No timeline overlap or duplicate warnings found.")
+    report_lines.append("19. Duplicated session logs: " + (str(len(duplicate_log_warnings)) if duplicate_log_warnings else "0"))
+    report_lines.append("20. Impossible durations warnings: " + str(len(timeline_warnings) + len(log_warnings)))
+    report_lines.append("21. Warnings:")
+    if warning_lines:
+        report_lines.extend([f"  - {w}" for w in warning_lines])
+    else:
+        report_lines.append("  None")
+    cached_total = stats_doc.get('online_seconds', 0)
+    summary_match = (summary_total == timeline_total == precise_total)
+    report_lines.extend([
+        "",
+        "22. Final comparison:",
+        f"   Timeline Total: {timeline_total}s ({format_seconds(timeline_total)})",
+        f"   Session Logs Total: {session_logs_total}s ({format_seconds(session_logs_total)})",
+        f"   Precise Stats Total: {precise_total}s ({format_seconds(precise_total)})",
+        f"   Summary Total: {summary_total}s ({format_seconds(summary_total)})",
+        f"   Cached daily_stats.online_seconds: {cached_total}s ({format_seconds(cached_total)})",
+        f"   Difference Timeline vs Precise: {precise_total - timeline_total}s ({format_seconds(abs(precise_total - timeline_total))})",
+        f"   Difference Timeline vs Session Logs: {session_logs_total - timeline_total}s ({format_seconds(abs(session_logs_total - timeline_total))})",
+        f"   Summary matches Timeline+Precise: {'YES' if summary_match else 'NO'}",
+    ])
+
+    # Send the report in chunks if needed
+    def chunk_lines(lines, max_size=1900):
+        chunk = []
+        size = 0
+        for line in lines:
+            if size + len(line) + 1 > max_size:
+                yield chunk
+                chunk = []
+                size = 0
+            chunk.append(line)
+            size += len(line) + 1
+        if chunk:
+            yield chunk
+
+    await ctx.send("```\n" + "\n".join(report_lines) + "\n```")
+
+    if timeline_lines:
+        for chunk in chunk_lines(["Timeline sessions:"] + timeline_lines):
+            await ctx.send("```\n" + "\n".join(chunk) + "\n```")
+
+    if session_log_lines:
+        for chunk in chunk_lines(["Session logs:"] + session_log_lines):
+            await ctx.send("```\n" + "\n".join(chunk) + "\n```")
+
+
+@bot.command(name="rebuildsummary")
+async def cmd_rebuild_summary(ctx, date_arg: str = None):
+    """Repair the cached daily_stats.online_seconds value from the authoritative timeline."""
+    if date_arg is None:
+        await ctx.send("❌ استخدم: `!rebuildsummary YYYY-MM-DD`")
+        return
+
+    try:
+        date_key = datetime.strptime(date_arg, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except Exception:
+        await ctx.send("❌ تنسيق التاريخ غير صحيح. استخدم YYYY-MM-DD")
+        return
+
+    try:
+        update_daily_online(None, None, date_key=date_key)
+        computed_total = compute_logical_day_timeline_total(date_key)
+        stats_doc = daily_stats_collection.find_one({"_id": date_key}) or {}
+        cached_total = stats_doc.get("online_seconds", 0)
+        await ctx.send(
+            "✅ Rebuilt summary total for {}.\n"
+            "Timeline-based total: {} ({})\n"
+            "Cached daily_stats.online_seconds: {} ({})\n"
+            "Summary total is now authoritative from timeline.\n"
+            .format(
+                date_key,
+                computed_total,
+                format_seconds(computed_total),
+                cached_total,
+                format_seconds(cached_total)
+            )
+        )
+    except Exception as e:
+        await ctx.send(f"❌ خطأ أثناء إعادة بناء الملخص: {e}")
+
+
 @bot.command(name="precisestats")
 async def cmd_precise_stats(ctx, date_arg: str = None):
     """عرض تقرير الإحصائيات الدقيقة في القناة المخصصة (Real-time only)."""
@@ -2156,6 +2615,7 @@ async def roblox_radar_loop():
     if not alert_channel: return
 
     now = datetime.now(ZoneInfo("Europe/Lisbon"))
+    normalize_timeline_session_start_for_current_day(now)
     await maybe_close_logical_day(now)
 
     async with aiohttp.ClientSession() as session:
@@ -2498,9 +2958,15 @@ async def roblox_radar_loop():
                                 loff_a = _make_aware(loff)
                                 if loff_a is None:
                                     loff_a = loff
-                                if (now - loff_a) >= timedelta(minutes=30):
+                                current_start = _make_aware(state.get("timeline_current_session_start"))
+                                if current_start and loff_a <= current_start:
+                                    # Stale or crossed-day offline marker; clear markers to avoid invalid intervals.
+                                    state["timeline_current_session_start"] = None
+                                    state["timeline_last_offline_time"] = None
+                                    save_state_data()
+                                elif (now - loff_a) >= timedelta(minutes=30):
                                     try:
-                                        record_timeline_session(_make_aware(state.get("timeline_current_session_start")), loff_a)
+                                        record_timeline_session(current_start, loff_a)
                                     except Exception as e:
                                         print(f"Error recording timeline on offline threshold: {e}")
                                     # After closing/merging, always clear the offline marker to avoid stale values
