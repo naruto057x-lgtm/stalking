@@ -38,7 +38,7 @@ PRECISE_STATS_CHANNEL_ID = 1510936751252832288
 
 # ==================== MongoDB Configuration ====================
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://marwangamer056_db_user:NulNLKsdAz55Av50@cluster0.j35ail6.mongodb.net/?appName=Cluster0")
-INTERVAL = 20
+INTERVAL = 20 # فترة التحقق بالثواني (20 ثانية) 
 # ============================================================
 
 intents = discord.Intents.default()
@@ -321,11 +321,11 @@ def update_daily_online(start_dt, end_dt, date_key=None):
             day_end = clip_end if clip_end else day_end_default
 
             # Aggregate from timeline docs for the date.
-            # Only include the next-day document for an active logical day,
-            # to avoid counting closed-day waiting/grace delays recorded after midnight.
+            # Include the next-day calendar document if the logical day is still active,
+            # or if the closed logical day extended past midnight into the next calendar date.
             active_day = state.get("logical_day_key") == date_key
             doc_keys = [date_key]
-            if active_day:
+            if active_day or (clip_end and clip_end.date() > day):
                 doc_keys.append((day + timedelta(days=1)).strftime("%Y-%m-%d"))
 
             total = 0
@@ -391,7 +391,7 @@ def compute_logical_day_timeline_total(date_key):
         day_end = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
 
     doc_keys = [date_key]
-    if is_active:
+    if is_active or (logical_close_at and logical_close_at.date() > day):
         doc_keys.append((day + timedelta(days=1)).strftime("%Y-%m-%d"))
 
     total = 0
@@ -450,7 +450,7 @@ def get_logical_day_timeline_segments(date_key):
         day_end = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=tz)
 
     doc_keys = [date_key]
-    if is_active:
+    if is_active or (logical_close_at and logical_close_at.date() > day):
         doc_keys.append((day + timedelta(days=1)).strftime("%Y-%m-%d"))
 
     segments = []
@@ -1307,17 +1307,26 @@ async def cmd_new_history_friends(ctx):
         embed.add_field(name=f['display_name'], value=f"@{f['username']}\n📅 التوقيت: {f['detected_at']}", inline=False)
     await ctx.send(embed=embed)
 
+def build_direct_join_link(place_id, game_id=None):
+    if not place_id:
+        return None
+    if game_id:
+        return f"https://www.roblox.com/games/start?placeId={place_id}&gameId={game_id}"
+    return f"https://www.roblox.com/games/{place_id}"
+
+
 @bot.command(name="join")
 async def cmd_join(ctx):
     if not state.get("place_id") or not state.get("game_id"):
         await ctx.send("❌ اللاعب مش دخال أي لعبة دلوقتي، ما فيش رابط join متاح.")
         return
     
-    join_link = f"roblox://experiences/start?placeId={state['place_id']}&gameId={state['game_id']}"
+    join_link = build_direct_join_link(state["place_id"], state["game_id"])
     embed = discord.Embed(title="🔗 رابط الدخول المباشر (JOIN LINK)", color=0x2ecc71)
     embed.add_field(name="Click to Join", value=f"[اضغط هنا للدخول وراه الآن 🔥]({join_link})", inline=False)
     embed.set_footer(text="الرابط يفتح لعبة الروبلوكس تلقائياً")
     await ctx.send(embed=embed)
+
 
 @bot.command(name="map")
 async def cmd_map(ctx):
@@ -1757,16 +1766,20 @@ def build_daily_timeline_embeds(date_key, include_open_session=False):
 
     # Load calendar docs for the day and the next calendar day (to capture early-morning segments)
     # For logical day boundaries, we need both the start calendar day and next calendar day
-    # to handle sessions that cross midnight
+    # to handle sessions that cross midnight.
     doc1 = daily_timeline_collection.find_one({"_id": date_key}) or {}
-    # Only load next calendar day if this is NOT a closed logical day
-    # (closed days have their segments already clipped and stored within the logical-day doc)
-    if state.get("logical_day_key") == date_key:
+    include_next_day = state.get("logical_day_key") == date_key
+    if not include_next_day:
+        stats_doc = daily_stats_collection.find_one({"_id": date_key}) or {}
+        lc = stats_doc.get("logical_close_at")
+        if lc and _make_aware(lc).date() > day:
+            include_next_day = True
+
+    if include_next_day:
         doc2 = daily_timeline_collection.find_one({"_id": (day + timedelta(days=1)).strftime("%Y-%m-%d")}) or {}
         process_doc(doc1)
         process_doc(doc2)
     else:
-        # For historical/closed days, only load from the logical day's own document
         process_doc(doc1)
 
     # Optionally include any current open session portion overlapping this logical day
@@ -2872,10 +2885,9 @@ async def roblox_radar_loop():
                         state["game_session_start"] = now
                         state["session_recorded"] = False
                         page_link = f"https://www.roblox.com/games/{place_id}"
-                        join_link = f"roblox://experiences/start?placeId={place_id}&gameId={game_id}" if game_id else page_link
+                        join_link = build_direct_join_link(place_id, game_id)
                         embed = discord.Embed(title="🎮 [الهدف انتقل لماب جديدة]", description="اللاعب دخل ماب جديدة في نفس الجلسة الحالية.", color=0x2ecc71)
                         embed.add_field(name="اسم الماب الحالية", value=f"**{game}**", inline=False)
-                        embed.add_field(name="رابط صفحة الماب (Roblox Page)", value=f"[اضغط هنا لفتح الصفحة]({page_link})", inline=False)
                         embed.add_field(name="رابط الدخول المباشر وراه (JOIN LINK) 🔥", value=f"[اضغط هنا للدخول وراه السيرفر فوراً]({join_link})", inline=False)
                         await alert_channel.send(embed=embed)
 
@@ -2912,10 +2924,9 @@ async def roblox_radar_loop():
                             state["game_session_start"] = now
                             state["session_recorded"] = False  # إعادة تعيين عند بدء جلسة جديدة
                             page_link = f"https://www.roblox.com/games/{place_id}"
-                            join_link = f"roblox://experiences/start?placeId={place_id}&gameId={game_id}" if game_id else page_link
+                            join_link = build_direct_join_link(place_id, game_id)
                             embed = discord.Embed(title="🎮 [بدأ يلعب ماب جديدة الآن]", description=f"الهدف دخل سيرفر ماب جديد يعيش!", color=0x2ecc71)
                             embed.add_field(name="اسم الماب الحالية", value=f"**{game}**", inline=False)
-                            embed.add_field(name="رابط صفحة الماب (Roblox Page)", value=f"[اضغط هنا لفتح الصفحة]({page_link})", inline=False)
                             embed.add_field(name="رابط الدخول المباشر وراه (JOIN LINK) 🔥", value=f"[اضغط هنا للدخول وراه السيرفر فوراً]({join_link})", inline=False)
                             await alert_channel.send(embed=embed)
 
