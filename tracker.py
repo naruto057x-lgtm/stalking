@@ -34,10 +34,6 @@ WEEKLY_SUMMARY_CHANNEL_ID = 1510275621316595802
 DETAIL_CHANNEL_ID = 1510541538445230080
 AVATAR_CHANGE_CHANNEL_ID = 1510752801196871850
 TIMELINE_CHANNEL_ID = 1510754643414876301
-BADGES_CHANNEL_ID = 1513158814407458927
-
-_badge_check_counter = 0
-BADGE_CHECK_EVERY = 15  # فحص كل 15 دورة = كل 5 دقايق تقريبًا
 PRECISE_STATS_CHANNEL_ID = 1510936751252832288
 
 # ==================== MongoDB Configuration ====================
@@ -102,7 +98,7 @@ state_collection = db.state
 daily_stats_collection = db.daily_stats
 session_logs = db.session_logs
 daily_timeline_collection = db.daily_timeline
-badges_collection = db.badges
+
 # ==================== Database Helper Functions ====================
 def load_friends_data():
     """تحميل بيانات الأصدقاء من MongoDB"""
@@ -1029,192 +1025,6 @@ def record_game_session(place_id, game_name, duration_seconds, start_time=None, 
     else:
         update_daily_game(place_id, game_name, duration_seconds, date_key=report_date_key)
 # --- جلب بيانات أي يوزر بالـ ID من روبلوكس ---
-    # ==================== Badge Tracker ====================
-
-async def fetch_user_badges(session, limit=25):
-    """جلب أحدث badges للمستخدم من Roblox"""
-    try:
-        url = f"https://badges.roblox.com/v1/users/{TARGET_USER_ID}/badges?limit={limit}&sortOrder=Desc"
-        async with session.get(url, timeout=10) as r:
-            if r.status == 200:
-                data = await r.json()
-                return data.get("data", [])
-    except Exception as e:
-        print(f"Error fetching badges: {e}")
-    return []
-
-
-async def fetch_badge_awarded_date(session, badge_id):
-    """جلب تاريخ حصول المستخدم على badge معينة"""
-    try:
-        url = f"https://badges.roblox.com/v1/users/{TARGET_USER_ID}/badges/awarded-dates?badgeIds={badge_id}"
-        async with session.get(url, headers=headers, timeout=10) as r:
-            if r.status == 200:
-                data = await r.json()
-                items = data.get("data", [])
-                if items:
-                    return items[0].get("awardedDate")
-    except Exception as e:
-        print(f"Error fetching badge award date for {badge_id}: {e}")
-    return None
-
-
-async def fetch_badge_thumbnail(session, badge_id):
-    """جلب صورة البادج"""
-    try:
-        url = f"https://thumbnails.roblox.com/v1/badges/icons?badgeIds={badge_id}&size=150x150&format=Png"
-        async with session.get(url, timeout=10) as r:
-            if r.status == 200:
-                data = await r.json()
-                items = data.get("data", [])
-                if items:
-                    return items[0].get("imageUrl")
-    except Exception as e:
-        print(f"Error fetching badge thumbnail: {e}")
-    return None
-
-
-def load_badge_state():
-    """تحميل حالة البادجات من MongoDB"""
-    doc = badges_collection.find_one({"_id": "badge_state"})
-    if doc:
-        return {
-            "known_badge_ids": doc.get("known_badge_ids", []),
-            "last_badge_name": doc.get("last_badge_name"),
-            "last_badge_time": _make_aware(doc.get("last_badge_time")) if doc.get("last_badge_time") else None,
-            "last_badge_game": doc.get("last_badge_game"),
-            "last_badge_place_id": doc.get("last_badge_place_id"),
-            "last_badge_image_url": doc.get("last_badge_image_url"),
-            "last_badge_description": doc.get("last_badge_description"),
-        }
-    return {
-        "known_badge_ids": [],
-        "last_badge_name": None,
-        "last_badge_time": None,
-        "last_badge_game": None,
-        "last_badge_place_id": None,
-        "last_badge_image_url": None,
-        "last_badge_description": None,
-    }
-
-
-def save_badge_state(data):
-    """حفظ حالة البادجات في MongoDB"""
-    doc = {k: v for k, v in data.items()}
-    doc["_id"] = "badge_state"
-    doc["last_updated"] = datetime.now(ZoneInfo("Europe/Lisbon"))
-    badges_collection.replace_one({"_id": "badge_state"}, doc, upsert=True)
-
-
-async def check_new_badges(session):
-    """الوظيفة الأساسية لفحص البادجات الجديدة وإرسال الإشعارات"""
-    badge_state = load_badge_state()
-    known_ids = set(badge_state.get("known_badge_ids", []))
-
-    badges = await fetch_user_badges(session, limit=25)
-    if not badges:
-        return
-
-    current_ids = [b["id"] for b in badges]
-
-    # أول تشغيل — حفظ كل البادجات الموجودة بصمت
-    if not known_ids:
-        badge_state["known_badge_ids"] = current_ids
-        if badges:
-            first = badges[0]
-            awarding = first.get("awardingUniverse") or {}
-            badge_state["last_badge_name"] = first.get("name") or first.get("displayName")
-            badge_state["last_badge_game"] = awarding.get("name")
-            badge_state["last_badge_place_id"] = awarding.get("rootPlaceId")
-            badge_state["last_badge_description"] = first.get("description", "")
-            awarded_raw = await fetch_badge_awarded_date(session, first["id"])
-            if awarded_raw:
-                try:
-                    awarded_dt = datetime.fromisoformat(awarded_raw.replace("Z", "+00:00"))
-                    badge_state["last_badge_time"] = awarded_dt.astimezone(ZoneInfo("Europe/Lisbon"))
-                except Exception:
-                    badge_state["last_badge_time"] = datetime.now(ZoneInfo("Europe/Lisbon"))
-            thumb = await fetch_badge_thumbnail(session, first["id"])
-            badge_state["last_badge_image_url"] = thumb
-        save_badge_state(badge_state)
-        print(f"[Badges] ✅ First run — stored {len(current_ids)} known badges silently.")
-        return
-
-    # فحص البادجات الجديدة
-    new_badges = [b for b in badges if b["id"] not in known_ids]
-    if not new_badges:
-        return
-
-    badges_channel = bot.get_channel(BADGES_CHANNEL_ID)
-    if badges_channel is None:
-        try:
-            badges_channel = await bot.fetch_channel(BADGES_CHANNEL_ID)
-        except Exception as e:
-            print(f"Error fetching badges channel: {e}")
-            badges_channel = None
-
-    for badge in reversed(new_badges):  # من الأقدم للأحدث
-        badge_id = badge["id"]
-        badge_name = badge.get("name") or badge.get("displayName") or "Unknown"
-        badge_desc = badge.get("description") or ""
-        awarding = badge.get("awardingUniverse") or {}
-        game_name = awarding.get("name") or "Unknown"
-        place_id = awarding.get("rootPlaceId")
-
-        # وقت الحصول على البادج
-        awarded_time = datetime.now(ZoneInfo("Europe/Lisbon"))
-        awarded_raw = await fetch_badge_awarded_date(session, badge_id)
-        if awarded_raw:
-            try:
-                awarded_dt = datetime.fromisoformat(awarded_raw.replace("Z", "+00:00"))
-                awarded_time = awarded_dt.astimezone(ZoneInfo("Europe/Lisbon"))
-            except Exception:
-                pass
-
-        # صورة البادج
-        thumb_url = await fetch_badge_thumbnail(session, badge_id)
-
-        time_str = awarded_time.strftime("%Y-%m-%d %I:%M:%S %p")
-
-        embed = discord.Embed(
-            title="🏅 [بادج جديدة!]",
-            description=f"الهدف حصل على بادج جديدة!",
-            color=0xf1c40f
-        )
-        embed.add_field(name="🎖️ اسم البادج", value=f"**{badge_name}**", inline=False)
-        if badge_desc:
-            embed.add_field(name="📝 الوصف", value=badge_desc[:200], inline=False)
-        embed.add_field(name="🎮 من لعبة", value=f"**{game_name}**", inline=True)
-        if place_id:
-            embed.add_field(
-                name="🔗 رابط اللعبة",
-                value=f"[اضغط هنا](https://www.roblox.com/games/{place_id})",
-                inline=True
-            )
-        embed.add_field(name="⏰ وقت الحصول", value=f"`{time_str}`", inline=False)
-        embed.add_field(name="🆔 Badge ID", value=f"`{badge_id}`", inline=True)
-        if thumb_url:
-            embed.set_thumbnail(url=thumb_url)
-        embed.set_footer(text="نظام رادار البادجات — تحديث تلقائي كل 5 دقايق")
-
-        if badges_channel:
-            try:
-                await badges_channel.send(embed=embed)
-            except Exception as e:
-                print(f"Error sending badge embed: {e}")
-
-        # تحديث آخر بادج
-        badge_state["last_badge_name"] = badge_name
-        badge_state["last_badge_time"] = awarded_time
-        badge_state["last_badge_game"] = game_name
-        badge_state["last_badge_place_id"] = place_id
-        badge_state["last_badge_image_url"] = thumb_url
-        badge_state["last_badge_description"] = badge_desc
-        known_ids.add(badge_id)
-
-    badge_state["known_badge_ids"] = list(known_ids)
-    save_badge_state(badge_state)
-    print(f"[Badges] ✅ {len(new_badges)} new badge(s) detected and sent.")
 async def fetch_single_user_profile(session, user_id):
     try:
         async with session.get(f"https://users.roblox.com/v1/users/{user_id}", timeout=10) as r:
@@ -1302,15 +1112,14 @@ async def check_channel(ctx):
     if ctx.command:
         if ctx.command.name == "detail":
             return ctx.channel.id in [CMD_CHANNEL_ID, DETAIL_CHANNEL_ID]
-      if ctx.command.name == "timeline":
+        if ctx.command.name == "timeline":
             return ctx.channel.id == TIMELINE_CHANNEL_ID
-        if ctx.command.name == "lastbadge":
-            return ctx.channel.id in [CMD_CHANNEL_ID, BADGES_CHANNEL_ID]
     return ctx.channel.id == CMD_CHANNEL_ID
 
 
 @bot.event
 async def on_command_error(ctx, error):
+    # Provide clear feedback when a command is blocked by the channel check
     if isinstance(error, commands.CheckFailure):
         if ctx.command:
             if ctx.command.name == "timeline":
@@ -1322,11 +1131,9 @@ async def on_command_error(ctx, error):
             if ctx.command.name == "detail":
                 await ctx.send("❌ هذا الأمر مسموح فقط في قنوات الأوامر أو التفاصيل.")
                 return
-            if ctx.command.name == "lastbadge":
-                await ctx.send("❌ هذا الأمر مسموح فقط في قنوات الأوامر أو قناة البادجات.")
-                return
         await ctx.send("❌ لا تملك صلاحية استخدام هذا الأمر في هذه القناة.")
         return
+    # For other errors, fall back to printing to console and allow default handling
     print(f"Command error: {error}")
 
 # --- الأوامر التفاعلية ---
@@ -1456,51 +1263,6 @@ async def cmd_last_seen(ctx):
 async def cmd_last_game(ctx):
     time_str = get_relative_time_str(state["last_game_time"])
     await ctx.send(f"🎮 **آخر ماب دخلها:** {state['last_game_name']} \n⏱️ **منذ:** `{time_str}`")
-
-@bot.command(name="lastbadge")
-async def cmd_last_badge(ctx):
-    """عرض آخر بادج حصل عليها الهدف"""
-    badge_state = load_badge_state()
-
-    badge_name = badge_state.get("last_badge_name")
-    badge_time = badge_state.get("last_badge_time")
-    badge_game = badge_state.get("last_badge_game")
-    badge_place_id = badge_state.get("last_badge_place_id")
-    badge_image = badge_state.get("last_badge_image_url")
-    badge_desc = badge_state.get("last_badge_description")
-
-    if not badge_name:
-        embed = discord.Embed(
-            title="❓ لا توجد بيانات بادجات",
-            description="لم يتم رصد أي بادج بعد منذ تشغيل الرادار.",
-            color=0x95a5a6
-        )
-        await ctx.send(embed=embed)
-        return
-
-    time_str = badge_time.strftime("%Y-%m-%d %I:%M:%S %p") if badge_time else "Unknown"
-    relative_time = get_relative_time_str(badge_time) if badge_time else "Unknown"
-
-    embed = discord.Embed(
-        title="🏅 آخر بادج حصل عليها الهدف",
-        color=0xf1c40f
-    )
-    embed.add_field(name="🎖️ اسم البادج", value=f"**{badge_name}**", inline=False)
-    if badge_desc:
-        embed.add_field(name="📝 الوصف", value=badge_desc[:200], inline=False)
-    embed.add_field(name="🎮 من لعبة", value=f"**{badge_game or 'Unknown'}**", inline=True)
-    if badge_place_id:
-        embed.add_field(
-            name="🔗 رابط اللعبة",
-            value=f"[اضغط هنا](https://www.roblox.com/games/{badge_place_id})",
-            inline=True
-        )
-    embed.add_field(name="⏰ وقت الحصول", value=f"`{time_str}`", inline=False)
-    embed.add_field(name="🕐 منذ", value=relative_time, inline=False)
-    if badge_image:
-        embed.set_thumbnail(url=badge_image)
-    embed.set_footer(text="آخر بادج مسجلة في نظام الرادار")
-    await ctx.send(embed=embed)
 
 @bot.command(name="about")
 async def cmd_about(ctx):
@@ -3296,18 +3058,6 @@ async def roblox_radar_loop():
                     friends_data["baseline_ids"] = current_ids
                     save_friends_data(friends_data)
 
-
-
-# ==================== Badge Check ====================
-            global _badge_check_counter
-            _badge_check_counter += 1
-            if _badge_check_counter >= BADGE_CHECK_EVERY:
-                _badge_check_counter = 0
-                try:
-                    await check_new_badges(session)
-                except Exception as e:
-                    print(f"Error checking badges: {e}")
-
             save_state_data()
 
         except Exception as e:
@@ -3317,6 +3067,7 @@ async def roblox_radar_loop():
                 save_state_data()
             except Exception as err:
                 print(f"Error saving state after loop: {err}")
+
 # أمر لعرض كل أوامر البوت بشكل منظم
 @bot.command(name="commands")
 async def cmd_commands(ctx):
@@ -3357,4 +3108,3 @@ async def cmd_commands(ctx):
 
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
-
