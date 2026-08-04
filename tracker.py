@@ -1266,11 +1266,13 @@ async def cmd_last_seen(ctx):
 
 @bot.command(name="lastgame")
 async def cmd_last_game(ctx):
+    """Show the most recently observed game and how long ago it was joined."""
     time_str = get_relative_time_str(state["last_game_time"])
     await ctx.send(f"🎮 **Last game joined:** {state['last_game_name']} \n⏱️ **Since:** `{time_str}`")
 
 @bot.command(name="about")
 async def cmd_about(ctx):
+    """Show the current Roblox bio/description for the target user."""
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(f"https://users.roblox.com/v1/users/{TARGET_USER_ID}") as r:
@@ -1286,6 +1288,7 @@ async def cmd_about(ctx):
 
 @bot.command(name="newfriends")
 async def cmd_new_friends(ctx):
+    """Show the most recently detected new friends."""
     data = load_friends_data()
     new_friends = data.get("detected_new_friends", {})
     if not new_friends:
@@ -1301,6 +1304,7 @@ async def cmd_new_friends(ctx):
 
 @bot.command(name="newhistoryfriends")
 async def cmd_new_history_friends(ctx):
+    """Show the full history of all newly detected friends."""
     data = load_friends_data()
     new_friends = data.get("detected_new_friends", {})
     if not new_friends:
@@ -1322,6 +1326,7 @@ def build_direct_join_link(place_id, game_id=None):
 
 @bot.command(name="join")
 async def cmd_join(ctx):
+    """Generate a direct join link for the current Roblox game session."""
     if not state.get("place_id") or not state.get("game_id"):
         await ctx.send("❌ The player is not in any game right now, so no join link is available.")
         return
@@ -1335,6 +1340,7 @@ async def cmd_join(ctx):
 
 @bot.command(name="map")
 async def cmd_map(ctx):
+    """Show the current map name and a link to its Roblox page."""
     if not state.get("place_id"):
         await ctx.send("❌ The player is not in any game right now, so no map is available.")
         return
@@ -1433,6 +1439,7 @@ async def cmd_avatar(ctx):
 
 @bot.command(name="top")
 async def cmd_top(ctx, limit: str = "3"):
+    """Show the top played games by total recorded play time."""
     stats = load_games_stats()
     if not stats:
         await ctx.send("📊 No game statistics data has been recorded yet.")
@@ -2199,6 +2206,7 @@ async def weekly_summary_task():
 
 @bot.command(name="online", aliases=["onlinetime", "timeonline"])
 async def cmd_online(ctx, period: str = "today", date_arg: str = None):
+    """Show online-time totals for today, yesterday, this week, this month, or a specific date."""
     query = period.lower() if period else "today"
     if date_arg:
         if query in ["date", "day"]:
@@ -2596,6 +2604,7 @@ async def cmd_precise_stats(ctx, date_arg: str = None):
 
 @bot.command(name="topmap", aliases=["maptop", "mapstats"])
 async def cmd_top_map(ctx, period: str = "yesterday", date_arg: str = None):
+    """Show the most played maps for yesterday, the week, the month, or a specific date."""
     query = period.lower() if period else "yesterday"
     if date_arg:
         if query in ["date", "day"]:
