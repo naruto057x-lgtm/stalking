@@ -5,7 +5,10 @@ from discord.ext import commands, tasks
 from datetime import datetime, timezone
 
 # ==================== الإعدادات الأساسية ====================
-BOT_TOKEN = "MTUwOTM3MDgyMzExNzUwODYyOA.Gcu40Y.GjypUteQXyVwe55l_Fgg0NCyD9P_eWQid4OzOY"  
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN not set in environment variables!")
+
 TARGET_USER_ID = "1249754394417696801"    
 WEBHOOK_URL = "https://discord.com/api/webhooks/1509353177663803522/OMdWhlsdCCU0rlTrVs-pWGt0Vhqnb81PYrJ9Q0IEOlhjs0ackASANAB59YOwfEuU-Bg7"
 COMMANDS_CHANNEL_ID = 1509464730509643846
