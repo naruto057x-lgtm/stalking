@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import discord
 from discord.ext import commands, tasks
 import aiohttp
 import json
-import os
 import sys
 import hashlib
 from datetime import datetime, timedelta, time as dt_time, timezone
