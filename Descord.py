@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import logging
 import os
 import sys
@@ -14,7 +15,7 @@ import motor.motor_asyncio
 from playwright.async_api import async_playwright
 
 # ==================== تأكيد البدء ====================
-print("🚀 Descord.py script started (Unified Selfbot - HTTP embeds)", flush=True)
+print("🚀 Descord.py script started (Unified Selfbot - fixed)", flush=True)
 
 # ==================== الإعدادات الأساسية ====================
 USER_TOKEN = os.getenv("USER_TOKEN")
@@ -53,17 +54,41 @@ def get_egypt_time(dt: datetime = None) -> str:
     local = dt.astimezone(cairo)
     return local.strftime("%I:%M %p, %A, %B %d, %Y (GMT+3)")
 
-# ==================== دوال HTTP لإرسال/تعديل Embeds ====================
+# ==================== دوال HTTP مع بناء embeds يدوياً ====================
 BASE_API = "https://discord.com/api/v10"
 HEADERS = {
     "Authorization": USER_TOKEN,
     "Content-Type": "application/json"
 }
 
+def embed_to_payload(embed: discord.Embed) -> dict:
+    """تحويل Embed إلى القاموس المطلوب يدوياً (لتجنب to_dict() غير المستقر)"""
+    payload = {}
+    if embed.title:
+        payload["title"] = embed.title
+    if embed.description:
+        payload["description"] = embed.description
+    if embed.color:
+        payload["color"] = embed.color.value if isinstance(embed.color, discord.Color) else embed.color
+    if embed.timestamp:
+        payload["timestamp"] = embed.timestamp.isoformat()
+    if embed.footer:
+        payload["footer"] = {"text": embed.footer.text}
+    if embed.thumbnail:
+        payload["thumbnail"] = {"url": embed.thumbnail.url}
+    if embed.image:
+        payload["image"] = {"url": embed.image.url}
+    if embed.fields:
+        fields = []
+        for f in embed.fields:
+            fields.append({"name": f.name, "value": f.value, "inline": f.inline})
+        payload["fields"] = fields
+    return payload
+
 async def send_embed(channel_id: int, embed: discord.Embed) -> int:
     """إرسال Embed إلى قناة عبر HTTP وإرجاع message_id"""
     url = f"{BASE_API}/channels/{channel_id}/messages"
-    payload = {"embeds": [embed.to_dict()]}
+    payload = {"embeds": [embed_to_payload(embed)]}
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=HEADERS, json=payload) as resp:
             if resp.status == 200:
@@ -78,7 +103,7 @@ async def send_embed(channel_id: int, embed: discord.Embed) -> int:
 async def edit_embed(channel_id: int, message_id: int, embed: discord.Embed):
     """تعديل رسالة موجودة ب Embed جديد"""
     url = f"{BASE_API}/channels/{channel_id}/messages/{message_id}"
-    payload = {"embeds": [embed.to_dict()]}
+    payload = {"embeds": [embed_to_payload(embed)]}
     async with aiohttp.ClientSession() as session:
         async with session.patch(url, headers=HEADERS, json=payload) as resp:
             if resp.status == 200:
@@ -91,9 +116,9 @@ async def send_embed_with_file(channel_id: int, embed: discord.Embed, file_bytes
     """إرسال Embed مع ملف (سكرين شوت)"""
     url = f"{BASE_API}/channels/{channel_id}/messages"
     form = aiohttp.FormData()
-    form.add_field("embeds", json.dumps([embed.to_dict()]), content_type="application/json")
+    form.add_field("embeds", json.dumps([embed_to_payload(embed)]), content_type="application/json")
     form.add_field("file", file_bytes.getvalue(), filename=filename, content_type="image/png")
-    headers = {"Authorization": USER_TOKEN}  # no Content-Type, aiohttp sets multipart
+    headers = {"Authorization": USER_TOKEN}
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, data=form) as resp:
             if resp.status == 200:
@@ -120,7 +145,7 @@ except Exception as e:
     logger.error(f"❌ MongoDB initialization failed: {e}")
     sys.exit(1)
 
-# ذاكرة مؤقتة (نخزن IDs فقط بدلاً من كائنات الرسالة)
+# ذاكرة مؤقتة
 active_online_msgs = {}      # user_id -> message_id
 active_activity_msgs = {}    # user_id -> {activity_name: message_id}
 current_activities = {}      # user_id -> [dicts]
@@ -162,7 +187,6 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
 async def on_ready():
     logger.info(f"👤 Selfbot logged in as {bot.user}")
 
-    # رسالة بدء التشغيل في قناة الأوامر
     embed = discord.Embed(
         title="⚡ Discord Monitor System Online",
         description=f"**Selfbot:** {bot.user.mention}\nAll systems ready.\nUse `!help` in this channel.",
@@ -171,11 +195,9 @@ async def on_ready():
     )
     await send_embed(COMMANDS_CHANNEL_ID, embed)
 
-    # بدء المهام الخلفية
     bot.loop.create_task(profile_check_loop())
     bot.loop.create_task(screenshot_worker())
 
-    # رسالة بدء المراقبة في قناة التغييرات
     embed2 = discord.Embed(title="🔄 Profile Monitoring Started", description="Checking profiles every minute.", color=0x00FF00)
     await send_embed(CHANGES_CHANNEL_ID, embed2)
 
@@ -361,27 +383,27 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
             msg_id = await send_embed(ONLINE_CHANNEL_ID, embed)
             if msg_id:
                 active_online_msgs[user_id] = msg_id
-                await online_msgs_col.update_one({"_id": user_id}, {"$set": {"msg_id": msg_id}}, upsert=True)
+                # نخزن وقت البدء أيضاً
+                await online_msgs_col.update_one(
+                    {"_id": user_id},
+                    {"$set": {"msg_id": msg_id, "start_time": now}},
+                    upsert=True
+                )
             await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_online": now}}, upsert=True)
         elif after.status == discord.Status.offline:
             if user_id in active_online_msgs:
                 msg_id = active_online_msgs.pop(user_id)
-                # نحتاج وقت البداية من قاعدة البيانات؟ سنحتفظ به في online_msgs_col
                 doc = await online_msgs_col.find_one({"_id": user_id})
-                start_time = doc.get("start_time") if doc else None
-                if not start_time:
-                    # يمكننا تقدير وقت البدء بأنه وقت إرسال الرسالة (ناقص مدة غير معروفة)
-                    # لكن الأفضل نعيد كتابة: عند إرسال رسالة أونلاين نخزن وقتها
-                    # لذا نحتاج لتعديل هيكل البيانات
-                    pass
-                # سنستخدم توقيت الرسالة القديمة إن أمكن
-                # لكن مؤقتًا سنستخدم now كبداية (وهذا غير دقيق)
-                # سنصلح لاحقًا بتخزين start_time في online_msgs_col
-                dur_str = "unknown"
+                if doc and doc.get("start_time"):
+                    start_time = doc["start_time"]
+                    duration = now - start_time
+                    dur_str = str(duration).split(".")[0]
+                else:
+                    dur_str = "unknown"
                 new_embed = discord.Embed(
                     title="🔴 Offline",
                     description=f"<@{user_id}> went offline.\n"
-                                f"🟢 Was online from: ?\n"
+                                f"🟢 Was online from: {get_egypt_time(start_time) if start_time else '?'}\n"
                                 f"🔴 Offline at: {get_egypt_time(now)}\n"
                                 f"⏱️ Session duration: {dur_str}",
                     color=0x747F8D
@@ -476,7 +498,7 @@ async def profile_check_loop():
                 embed.set_footer(text=f"Detected at {get_egypt_time()}")
                 screenshot = await take_profile_screenshot(uid)
                 file_bytes = screenshot
-                embed.set_image(url="attachment://profile.png")  # سيتم استبدال الرابط عند الرفع
+                embed.set_image(url="attachment://profile.png")
                 await send_embed_with_file(CHANGES_CHANNEL_ID, embed, file_bytes, f"profile_{uid}.png")
         await asyncio.sleep(60)
 
