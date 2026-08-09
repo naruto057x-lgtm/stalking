@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 import os
-from datetime import datetime, timezoneA
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -11,11 +11,14 @@ from discord.ext import commands
 import motor.motor_asyncio
 from playwright.async_api import async_playwright
 
-# ==================== الإعدادات الثابتة ====================
+# ==================== الإعدادات الأساسية ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 USER_TOKEN = os.getenv("USER_TOKEN")
-if not BOT_TOKEN or not USER_TOKEN:
-    raise ValueError("❌ BOT_TOKEN and USER_TOKEN must be set in environment variables.")
+
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN is required!")
+if not USER_TOKEN:
+    logging.warning("⚠️ USER_TOKEN not set. Selfbot features will be disabled.")
 
 TARGET_USER_IDS = [
     "1249754394417696801",
@@ -27,9 +30,7 @@ ONLINE_CHANNEL_ID = 1535834924958089286
 CHANGES_CHANNEL_ID = 1509353152724340846
 COMMANDS_CHANNEL_ID = 1509464730509643846
 
-MONGODB_URI = os.getenv("MONGODB_URI")
-if not MONGODB_URI:
-    MONGODB_URI = "mongodb://..."
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://...")
 
 # ==================== دوال مساعدة ====================
 def get_egypt_time(dt: datetime = None) -> str:
@@ -43,12 +44,20 @@ def get_egypt_time(dt: datetime = None) -> str:
 intents_bot = discord.Intents.default()
 intents_bot.message_content = True
 
-intents_self = discord.Intents.all()
-
 bot = commands.Bot(command_prefix="!", intents=intents_bot)
-bot.remove_command("help")  # إزالة الأمر المدمج عشان نضيف بتاعنا
+bot.remove_command("help")  # إزالة الأمر المدمج
 
-selfbot = discord.Client(intents=intents_self)
+# متغيرات حالة السيلف بوت (علشان نعرف نفحصها من البوت الأساسي)
+selfbot_ready = False
+selfbot_error = None
+selfbot_instance = None
+
+if USER_TOKEN:
+    intents_self = discord.Intents.all()
+    selfbot = discord.Client(intents=intents_self)
+    selfbot_instance = selfbot
+else:
+    selfbot = None
 
 # MongoDB
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
@@ -78,6 +87,8 @@ async def fetch_user_data(user_id: str) -> dict | None:
     return None
 
 async def take_profile_screenshot(user_id: str) -> io.BytesIO:
+    if not USER_TOKEN or not selfbot_ready:
+        return io.BytesIO(b'')
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -97,22 +108,75 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
             await browser.close()
         return io.BytesIO(screenshot)
 
-# ==================== البوت الأساسي ====================
+# ==================== البوت الأساسي (الأوامر) ====================
 @bot.event
 async def on_ready():
     logging.info(f"🤖 Bot logged in as {bot.user}")
-    # إرسال رسالة تأكيد في قناة الأوامر
     cmd_channel = bot.get_channel(COMMANDS_CHANNEL_ID)
     if cmd_channel:
+        status_text = "✅ Connected & monitoring" if selfbot_ready else (
+            f"❌ Offline - {selfbot_error or 'Invalid token or not started'}"
+        )
         embed = discord.Embed(
-            title="⚡ Discord Monitor Online",
-            description=f"**Bot:** {bot.user.mention}\n**Status:** Ready to receive commands.\n"
-                        f"All times in Egypt (GMT+3)\n\nUse `!help` to see available commands.",
+            title="⚡ Discord Monitor System Online",
+            description=f"**Bot:** {bot.user.mention}\n"
+                        f"**Selfbot:** {status_text}\n\n"
+                        f"Use `!status` for full diagnostics.\n"
+                        f"All times in Egypt (GMT+3)",
             color=0x00FF00,
             timestamp=datetime.utcnow()
         )
-        embed.set_footer(text="Radar system activated • Every minute profile check")
         await cmd_channel.send(embed=embed)
+
+@bot.command(name="status")
+async def status_check(ctx):
+    """تشخيص حالة النظام بالكامل"""
+    if ctx.channel.id != COMMANDS_CHANNEL_ID:
+        return
+    # فحص البوت
+    bot_status = "✅ Online"
+    # فحص السيلف بوت
+    if USER_TOKEN:
+        if selfbot_ready:
+            self_status = "✅ Connected"
+        else:
+            self_status = f"❌ Offline - {selfbot_error or 'Failed to login'}"
+    else:
+        self_status = "⚠️ Not configured (missing USER_TOKEN)"
+
+    # فحص القنوات (باستخدام البوت الأساسي)
+    channels = {
+        "Activity": bot.get_channel(ACTIVITY_CHANNEL_ID),
+        "Online": bot.get_channel(ONLINE_CHANNEL_ID),
+        "Changes": bot.get_channel(CHANGES_CHANNEL_ID),
+        "Commands": bot.get_channel(COMMANDS_CHANNEL_ID)
+    }
+    channels_status = "\n".join([f"{'✅' if ch else '❌'} {name} channel" for name, ch in channels.items()])
+
+    # فحص MongoDB
+    try:
+        await mongo_client.admin.command("ping")
+        mongo_status = "✅ Connected"
+    except Exception as e:
+        mongo_status = f"❌ Error: {e}"
+
+    # فحص المستخدمين المستهدفين (هل نقدر نجيب بياناتهم)
+    target_statuses = []
+    for uid in TARGET_USER_IDS:
+        data = await fetch_user_data(uid)
+        if data:
+            target_statuses.append(f"✅ <@{uid}> ({data.get('username')}) accessible")
+        else:
+            target_statuses.append(f"❌ <@{uid}> inaccessible")
+
+    embed = discord.Embed(title="📊 System Status", color=0x7289DA, timestamp=datetime.utcnow())
+    embed.add_field(name="Bot", value=bot_status, inline=False)
+    embed.add_field(name="Selfbot", value=self_status, inline=False)
+    embed.add_field(name="Channels", value=channels_status, inline=False)
+    embed.add_field(name="MongoDB", value=mongo_status, inline=False)
+    embed.add_field(name="Target Users", value="\n".join(target_statuses), inline=False)
+    embed.set_footer(text="Use !help for available commands")
+    await ctx.send(embed=embed)
 
 @bot.command(name="help", aliases=["commands"])
 async def custom_help(ctx):
@@ -125,6 +189,7 @@ async def custom_help(ctx):
     embed.add_field(name="!activity [user_id]", value="Show current activity and duration", inline=False)
     embed.add_field(name="!lastseen [user_id]", value="When the user was last online/offline", inline=False)
     embed.add_field(name="!lastactivity [user_id]", value="Last completed activity details", inline=False)
+    embed.add_field(name="!status", value="Show full system diagnostics", inline=False)
     embed.set_footer(text="All times in Egypt timezone (GMT+3)")
     await ctx.send(embed=embed)
 
@@ -192,6 +257,8 @@ async def _ss(ctx, user_id: str = None):
         return
     if not user_id:
         user_id = TARGET_USER_IDS[0]
+    if not selfbot_ready:
+        return await ctx.send("❌ Selfbot is offline, screenshot unavailable.")
     await ctx.send("📸 Taking screenshot, please wait...")
     await screenshot_queue.put((ctx, user_id))
 
@@ -203,7 +270,7 @@ async def _activity(ctx, user_id: str = None):
         user_id = TARGET_USER_IDS[0]
     acts = current_activities.get(user_id, [])
     if not acts:
-        return await ctx.send("❌ No current activity.")
+        return await ctx.send("❌ No current activity or selfbot offline.")
     desc = ""
     for act in acts:
         started = act.get("start_time")
@@ -251,166 +318,216 @@ async def _lastactivity(ctx, user_id: str = None):
     await ctx.send(embed=discord.Embed(title="📜 Last Activity", description=desc, color=0x7289DA))
 
 # ==================== السيلف بوت ====================
-@selfbot.event
-async def on_ready():
-    logging.info(f"👤 Selfbot logged in as {selfbot.user}")
-    # تشغيل المراقبة
-    selfbot.loop.create_task(profile_check_loop())
-    selfbot.loop.create_task(screenshot_worker())
+if selfbot:
+    @selfbot.event
+    async def on_ready():
+        global selfbot_ready, selfbot_error
+        selfbot_ready = True
+        selfbot_error = None
+        logging.info(f"👤 Selfbot logged in as {selfbot.user}")
+        selfbot.loop.create_task(profile_check_loop())
+        selfbot.loop.create_task(screenshot_worker())
+        # رسالة بدء في قناة التغييرات
+        changes_channel = selfbot.get_channel(CHANGES_CHANNEL_ID)
+        if changes_channel:
+            embed = discord.Embed(title="🔄 Profile Monitoring Started", description="Checking profiles every minute.", color=0x00FF00)
+            await changes_channel.send(embed=embed)
 
-@selfbot.event
-async def on_presence_update(before: discord.Member, after: discord.Member):
-    if str(after.id) not in TARGET_USER_IDS:
-        return
-    user_id = str(after.id)
-    now = datetime.utcnow()
-    online_channel = selfbot.get_channel(ONLINE_CHANNEL_ID)
-    activity_channel = selfbot.get_channel(ACTIVITY_CHANNEL_ID)
-    if not online_channel or not activity_channel:
-        return
+    @selfbot.event
+    async def on_connect():
+        # لو الاتصال تم ولكن ما وصلش لـ on_ready (مثلاً خطأ في المصادقة)
+        pass
 
-    # تتبع الأونلاين/أوفلاين
-    if before.status != after.status:
-        if after.status == discord.Status.online:
-            embed = discord.Embed(title="🟢 Online", description=f"<@{user_id}> is now online.\n🕒 {get_egypt_time(now)}", color=0x57F287)
+    @selfbot.event
+    async def on_disconnect():
+        global selfbot_ready
+        selfbot_ready = False
+
+    @selfbot.event
+    async def on_error(event, *args, **kwargs):
+        global selfbot_ready, selfbot_error
+        import traceback
+        err = traceback.format_exc()
+        logging.error(f"Selfbot error in {event}: {err}")
+        selfbot_error = f"Error in {event}"
+        selfbot_ready = False
+
+    @selfbot.event
+    async def on_presence_update(before: discord.Member, after: discord.Member):
+        if str(after.id) not in TARGET_USER_IDS:
+            return
+        user_id = str(after.id)
+        now = datetime.utcnow()
+        online_channel = selfbot.get_channel(ONLINE_CHANNEL_ID)
+        activity_channel = selfbot.get_channel(ACTIVITY_CHANNEL_ID)
+        if not online_channel or not activity_channel:
+            return
+
+        # تتبع الأونلاين/أوفلاين
+        if before.status != after.status:
+            if after.status == discord.Status.online:
+                embed = discord.Embed(title="🟢 Online", description=f"<@{user_id}> is now online.\n🕒 {get_egypt_time(now)}", color=0x57F287)
+                embed.set_thumbnail(url=after.display_avatar.url)
+                msg = await online_channel.send(embed=embed)
+                active_online_msgs[user_id] = msg
+                await online_msgs_col.update_one({"_id": user_id}, {"$set": {"msg_id": msg.id}}, upsert=True)
+                await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_online": now}}, upsert=True)
+            elif after.status == discord.Status.offline:
+                if user_id in active_online_msgs:
+                    old_msg = active_online_msgs.pop(user_id)
+                    start_time = old_msg.created_at
+                    duration = now - start_time
+                    dur_str = str(duration).split(".")[0]
+                    new_embed = discord.Embed(
+                        title="🔴 Offline",
+                        description=f"<@{user_id}> went offline.\n"
+                                    f"🟢 Was online from: {get_egypt_time(start_time)}\n"
+                                    f"🔴 Offline at: {get_egypt_time(now)}\n"
+                                    f"⏱️ Session duration: {dur_str}",
+                        color=0x747F8D
+                    )
+                    new_embed.set_thumbnail(url=after.display_avatar.url)
+                    await old_msg.edit(embed=new_embed)
+                    await online_msgs_col.delete_one({"_id": user_id})
+                await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": now}}, upsert=True)
+
+        # تتبع الأنشطة
+        before_acts = {act.name: act for act in before.activities if act.type != discord.ActivityType.custom}
+        after_acts = {act.name: act for act in after.activities if act.type != discord.ActivityType.custom}
+        started_acts = set(after_acts.keys()) - set(before_acts.keys())
+        ended_acts = set(before_acts.keys()) - set(after_acts.keys())
+
+        for name in started_acts:
+            act = after_acts[name]
+            start = act.start or now
+            embed = discord.Embed(title="🎮 Activity Started", description=f"<@{user_id}> started **{act.name}**\n🕒 Since: {get_egypt_time(start)}", color=0x5865F2)
             embed.set_thumbnail(url=after.display_avatar.url)
-            msg = await online_channel.send(embed=embed)
-            active_online_msgs[user_id] = msg
-            await online_msgs_col.update_one({"_id": user_id}, {"$set": {"msg_id": msg.id}}, upsert=True)
-            await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_online": now}}, upsert=True)
-        elif after.status == discord.Status.offline:
-            if user_id in active_online_msgs:
-                old_msg = active_online_msgs.pop(user_id)
-                start_time = old_msg.created_at
-                duration = now - start_time
-                dur_str = str(duration).split(".")[0]
-                new_embed = discord.Embed(
-                    title="🔴 Offline",
-                    description=f"<@{user_id}> went offline.\n"
-                                f"🟢 Was online from: {get_egypt_time(start_time)}\n"
-                                f"🔴 Offline at: {get_egypt_time(now)}\n"
-                                f"⏱️ Session duration: {dur_str}",
-                    color=0x747F8D
-                )
-                new_embed.set_thumbnail(url=after.display_avatar.url)
-                await old_msg.edit(embed=new_embed)
-                await online_msgs_col.delete_one({"_id": user_id})
-            await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": now}}, upsert=True)
+            msg = await activity_channel.send(embed=embed)
+            if user_id not in active_activity_msgs:
+                active_activity_msgs[user_id] = {}
+            active_activity_msgs[user_id][name] = msg
+            await activity_msgs_col.insert_one({"user_id": user_id, "activity_key": name, "msg_id": msg.id, "start_time": start})
+            if user_id not in current_activities:
+                current_activities[user_id] = []
+            current_activities[user_id].append({"name": name, "start_time": start})
 
-    # تتبع الأنشطة
-    before_acts = {act.name: act for act in before.activities if act.type != discord.ActivityType.custom}
-    after_acts = {act.name: act for act in after.activities if act.type != discord.ActivityType.custom}
-    started_acts = set(after_acts.keys()) - set(before_acts.keys())
-    ended_acts = set(before_acts.keys()) - set(after_acts.keys())
+        for name in ended_acts:
+            if user_id in active_activity_msgs and name in active_activity_msgs[user_id]:
+                old_msg = active_activity_msgs[user_id].pop(name)
+                doc = await activity_msgs_col.find_one({"user_id": user_id, "activity_key": name})
+                if doc:
+                    start_time = doc.get("start_time", old_msg.created_at)
+                    end_time = now
+                    duration = end_time - start_time
+                    dur_str = str(duration).split(".")[0]
+                    new_embed = discord.Embed(
+                        title="✅ Activity Ended",
+                        description=f"<@{user_id}> finished **{name}**\n"
+                                    f"🕒 Started: {get_egypt_time(start_time)}\n"
+                                    f"🏁 Ended: {get_egypt_time(end_time)}\n"
+                                    f"⏱️ Duration: {dur_str}",
+                        color=0xED4245
+                    )
+                    new_embed.set_thumbnail(url=after.display_avatar.url)
+                    await old_msg.edit(embed=new_embed)
+                    await activity_msgs_col.delete_one({"user_id": user_id, "activity_key": name})
+                    await last_activity_col.update_one(
+                        {"_id": user_id},
+                        {"$set": {"activity_name": name, "start": start_time, "end": end_time, "duration": dur_str}},
+                        upsert=True
+                    )
+            if user_id in current_activities:
+                current_activities[user_id] = [a for a in current_activities[user_id] if a["name"] != name]
 
-    for name in started_acts:
-        act = after_acts[name]
-        start = act.start or now
-        embed = discord.Embed(title="🎮 Activity Started", description=f"<@{user_id}> started **{act.name}**\n🕒 Since: {get_egypt_time(start)}", color=0x5865F2)
-        embed.set_thumbnail(url=after.display_avatar.url)
-        msg = await activity_channel.send(embed=embed)
-        if user_id not in active_activity_msgs:
-            active_activity_msgs[user_id] = {}
-        active_activity_msgs[user_id][name] = msg
-        await activity_msgs_col.insert_one({"user_id": user_id, "activity_key": name, "msg_id": msg.id, "start_time": start})
-        if user_id not in current_activities:
-            current_activities[user_id] = []
-        current_activities[user_id].append({"name": name, "start_time": start})
+    async def profile_check_loop():
+        await selfbot.wait_until_ready()
+        changes_channel = selfbot.get_channel(CHANGES_CHANNEL_ID)
+        if not changes_channel:
+            logging.error("❌ Changes channel not found.")
+            return
+        while not selfbot.is_closed():
+            for uid in TARGET_USER_IDS:
+                data = await fetch_user_data(uid)
+                if not data:
+                    continue
+                cached = await profile_cache_col.find_one({"_id": uid})
+                new_cache = {
+                    "username": data.get("username"),
+                    "global_name": data.get("global_name"),
+                    "bio": data.get("bio"),
+                    "avatar": data.get("avatar"),
+                    "banner": data.get("banner"),
+                    "clan_tag": data.get("clan", {}).get("tag") if data.get("clan") else None,
+                    "avatar_decoration": data.get("avatar_decoration_data", {}).get("asset") if data.get("avatar_decoration_data") else None
+                }
+                changes = []
+                if cached:
+                    for key in new_cache:
+                        if new_cache[key] != cached.get(key):
+                            changes.append(f"🔹 **{key.replace('_', ' ').title()}** changed: `{cached.get(key)}` → `{new_cache[key]}`")
+                if changes or not cached:
+                    if not cached:
+                        changes.append("🆕 Initial profile cached.")
+                    await profile_cache_col.update_one({"_id": uid}, {"$set": new_cache}, upsert=True)
+                    embed = discord.Embed(
+                        title="🔄 Profile Update Detected",
+                        description=f"<@{uid}> profile changed:\n" + "\n".join(changes),
+                        color=0xFFA500,
+                        timestamp=datetime.utcnow()
+                    )
+                    embed.set_footer(text=f"Detected at {get_egypt_time()}")
+                    if selfbot_ready:
+                        screenshot = await take_profile_screenshot(uid)
+                        file = discord.File(screenshot, filename=f"profile_{uid}.png")
+                        embed.set_image(url=f"attachment://profile_{uid}.png")
+                        await changes_channel.send(embed=embed, file=file)
+                    else:
+                        await changes_channel.send(embed=embed)
+            await asyncio.sleep(60)
 
-    for name in ended_acts:
-        if user_id in active_activity_msgs and name in active_activity_msgs[user_id]:
-            old_msg = active_activity_msgs[user_id].pop(name)
-            doc = await activity_msgs_col.find_one({"user_id": user_id, "activity_key": name})
-            if doc:
-                start_time = doc.get("start_time", old_msg.created_at)
-                end_time = now
-                duration = end_time - start_time
-                dur_str = str(duration).split(".")[0]
-                new_embed = discord.Embed(
-                    title="✅ Activity Ended",
-                    description=f"<@{user_id}> finished **{name}**\n"
-                                f"🕒 Started: {get_egypt_time(start_time)}\n"
-                                f"🏁 Ended: {get_egypt_time(end_time)}\n"
-                                f"⏱️ Duration: {dur_str}",
-                    color=0xED4245
-                )
-                new_embed.set_thumbnail(url=after.display_avatar.url)
-                await old_msg.edit(embed=new_embed)
-                await activity_msgs_col.delete_one({"user_id": user_id, "activity_key": name})
-                await last_activity_col.update_one(
-                    {"_id": user_id},
-                    {"$set": {"activity_name": name, "start": start_time, "end": end_time, "duration": dur_str}},
-                    upsert=True
-                )
-        if user_id in current_activities:
-            current_activities[user_id] = [a for a in current_activities[user_id] if a["name"] != name]
+    async def screenshot_worker():
+        while True:
+            ctx, user_id = await screenshot_queue.get()
+            try:
+                screenshot = await take_profile_screenshot(user_id)
+                if screenshot.getbuffer().nbytes == 0:
+                    await ctx.send("❌ Failed to capture screenshot.")
+                else:
+                    file = discord.File(screenshot, filename=f"ss_{user_id}.png")
+                    embed = discord.Embed(title="📸 Profile Screenshot", color=0x5865F2)
+                    embed.set_image(url=f"attachment://ss_{user_id}.png")
+                    embed.set_footer(text=f"Requested by {ctx.author} • {get_egypt_time()}")
+                    await ctx.send(embed=embed, file=file)
+            except Exception as e:
+                await ctx.send(f"❌ Failed to take screenshot: {e}")
+            finally:
+                screenshot_queue.task_done()
 
-async def profile_check_loop():
-    await selfbot.wait_until_ready()
-    changes_channel = selfbot.get_channel(CHANGES_CHANNEL_ID)
-    if not changes_channel:
-        logging.error("❌ Changes channel not found.")
-        return
-    # رسالة بداية مراقبة البروفايلات
-    embed = discord.Embed(title="🔄 Profile Monitoring Started", description="Checking profiles every minute for changes.", color=0x00FF00)
-    await changes_channel.send(embed=embed)
-    while not selfbot.is_closed():
-        for uid in TARGET_USER_IDS:
-            data = await fetch_user_data(uid)
-            if not data:
-                continue
-            cached = await profile_cache_col.find_one({"_id": uid})
-            new_cache = {
-                "username": data.get("username"),
-                "global_name": data.get("global_name"),
-                "bio": data.get("bio"),
-                "avatar": data.get("avatar"),
-                "banner": data.get("banner"),
-                "clan_tag": data.get("clan", {}).get("tag") if data.get("clan") else None,
-                "avatar_decoration": data.get("avatar_decoration_data", {}).get("asset") if data.get("avatar_decoration_data") else None
-            }
-            changes = []
-            if cached:
-                for key in new_cache:
-                    if new_cache[key] != cached.get(key):
-                        changes.append(f"🔹 **{key.replace('_', ' ').title()}** changed: `{cached.get(key)}` → `{new_cache[key]}`")
-            if changes or not cached:
-                if not cached:
-                    changes.append("🆕 Initial profile cached.")
-                await profile_cache_col.update_one({"_id": uid}, {"$set": new_cache}, upsert=True)
-                embed = discord.Embed(
-                    title="🔄 Profile Update Detected",
-                    description=f"<@{uid}> profile changed:\n" + "\n".join(changes),
-                    color=0xFFA500,
-                    timestamp=datetime.utcnow()
-                )
-                embed.set_footer(text=f"Detected at {get_egypt_time()}")
-                screenshot = await take_profile_screenshot(uid)
-                file = discord.File(screenshot, filename=f"profile_{uid}.png")
-                embed.set_image(url=f"attachment://profile_{uid}.png")
-                await changes_channel.send(embed=embed, file=file)
-        await asyncio.sleep(60)
-
-async def screenshot_worker():
-    while True:
-        ctx, user_id = await screenshot_queue.get()
-        try:
-            screenshot = await take_profile_screenshot(user_id)
-            file = discord.File(screenshot, filename=f"ss_{user_id}.png")
-            embed = discord.Embed(title="📸 Profile Screenshot", color=0x5865F2)
-            embed.set_image(url=f"attachment://ss_{user_id}.png")
-            embed.set_footer(text=f"Requested by {ctx.author} • {get_egypt_time()}")
-            await ctx.send(embed=embed, file=file)
-        except Exception as e:
-            await ctx.send(f"❌ Failed to take screenshot: {e}")
-        finally:
-            screenshot_queue.task_done()
-
+# ==================== التشغيل الآمن ====================
 async def main():
-    await asyncio.gather(
-        selfbot.start(USER_TOKEN),
-        bot.start(BOT_TOKEN)
-    )
+    tasks = []
+    # بدء البوت الأساسي
+    tasks.append(asyncio.create_task(bot.start(BOT_TOKEN)))
+    # بدء السيلف بوت إن أمكن
+    if selfbot and USER_TOKEN:
+        async def start_selfbot():
+            global selfbot_error, selfbot_ready
+            try:
+                await selfbot.start(USER_TOKEN)
+            except discord.LoginFailure as e:
+                logging.error(f"❌ Selfbot login failed: {e}")
+                selfbot_error = "Invalid token (LoginFailure)"
+                selfbot_ready = False
+            except Exception as e:
+                logging.error(f"❌ Selfbot startup error: {e}")
+                selfbot_error = str(e)
+                selfbot_ready = False
+        tasks.append(asyncio.create_task(start_selfbot()))
+    else:
+        logging.warning("Selfbot not started (missing USER_TOKEN or disabled).")
+
+    # الانتظار لكل المهام بدون ما نوقف لو في Exception
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
