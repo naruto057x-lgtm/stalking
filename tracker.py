@@ -46,9 +46,7 @@ MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://marwangamer056_db_user:Nul
 INTERVAL = 20  # polling interval in seconds
 # ============================================================
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!")
 
 USER_NAME = "Unknown"
 DISPLAY_NAME = "Unknown"
