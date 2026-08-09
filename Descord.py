@@ -348,7 +348,9 @@ if selfbot:
         selfbot.loop.create_task(profile_check_loop())
         selfbot.loop.create_task(screenshot_worker())
         try:
-            # الاعتماد على البوت الأساسي في إرسال الرسايل بدل السيلف بوت
+            # هنا التعديل المهم، بنستنى البوت الأساسي يجهز الأول
+            await bot.wait_until_ready() 
+            
             changes_channel = bot.get_channel(CHANGES_CHANNEL_ID)
             if not changes_channel:
                 changes_channel = await bot.fetch_channel(CHANGES_CHANNEL_ID)
@@ -380,10 +382,13 @@ if selfbot:
     async def on_presence_update(before: discord.Member, after: discord.Member):
         if str(after.id) not in TARGET_USER_IDS:
             return
+        
+        # بنضمن برضه إن البوت الأساسي يكون شغال
+        await bot.wait_until_ready()
+        
         user_id = str(after.id)
         now = datetime.now(timezone.utc)
         try:
-            # البوت الأساسي هو اللي بيجيب الرومات ويبعت
             online_channel = bot.get_channel(ONLINE_CHANNEL_ID)
             if not online_channel:
                 online_channel = await bot.fetch_channel(ONLINE_CHANNEL_ID)
@@ -473,8 +478,8 @@ if selfbot:
 
     async def profile_check_loop():
         await selfbot.wait_until_ready()
+        await bot.wait_until_ready() # بنضمن البوت شغال عشان يقدر يبعت في الرومات
         try:
-            # البوت الأساسي بيجيب الروم
             changes_channel = bot.get_channel(CHANGES_CHANNEL_ID)
             if not changes_channel:
                 changes_channel = await bot.fetch_channel(CHANGES_CHANNEL_ID)
