@@ -3,10 +3,9 @@ aiohttp==3.9.3
 pymongo==4.6.1
 requests==2.31.0
 instagrapi==2.0.0
-PyNaCl==1.5.0 # Required for discord.py voice features (might resolve audioop issue)
+PyNaCl==1.5.0
 audioop-lts
 dnspython==2.6.1
 Pillow==10.4.0
-playwright==1.40.0
-zoneinfo
 motor==3.3.2
+playwright==1.40.0
