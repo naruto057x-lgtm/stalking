@@ -348,7 +348,11 @@ if selfbot:
         selfbot.loop.create_task(profile_check_loop())
         selfbot.loop.create_task(screenshot_worker())
         try:
-            changes_channel = await selfbot.fetch_channel(CHANGES_CHANNEL_ID)
+            # الاعتماد على البوت الأساسي في إرسال الرسايل بدل السيلف بوت
+            changes_channel = bot.get_channel(CHANGES_CHANNEL_ID)
+            if not changes_channel:
+                changes_channel = await bot.fetch_channel(CHANGES_CHANNEL_ID)
+                
             embed = discord.Embed(title="🔄 Profile Monitoring Started", description="Checking profiles every minute.", color=0x00FF00)
             await changes_channel.send(embed=embed)
         except Exception as e:
@@ -379,8 +383,14 @@ if selfbot:
         user_id = str(after.id)
         now = datetime.now(timezone.utc)
         try:
-            online_channel = await selfbot.fetch_channel(ONLINE_CHANNEL_ID)
-            activity_channel = await selfbot.fetch_channel(ACTIVITY_CHANNEL_ID)
+            # البوت الأساسي هو اللي بيجيب الرومات ويبعت
+            online_channel = bot.get_channel(ONLINE_CHANNEL_ID)
+            if not online_channel:
+                online_channel = await bot.fetch_channel(ONLINE_CHANNEL_ID)
+                
+            activity_channel = bot.get_channel(ACTIVITY_CHANNEL_ID)
+            if not activity_channel:
+                activity_channel = await bot.fetch_channel(ACTIVITY_CHANNEL_ID)
         except Exception as e:
             logger.error(f"Failed to fetch channels: {e}")
             return
@@ -464,10 +474,14 @@ if selfbot:
     async def profile_check_loop():
         await selfbot.wait_until_ready()
         try:
-            changes_channel = await selfbot.fetch_channel(CHANGES_CHANNEL_ID)
+            # البوت الأساسي بيجيب الروم
+            changes_channel = bot.get_channel(CHANGES_CHANNEL_ID)
+            if not changes_channel:
+                changes_channel = await bot.fetch_channel(CHANGES_CHANNEL_ID)
         except Exception as e:
             logger.error(f"❌ Could not fetch changes channel: {e}")
             return
+            
         while not selfbot.is_closed():
             for uid in TARGET_USER_IDS:
                 data = await fetch_user_data(uid)
