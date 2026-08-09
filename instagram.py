@@ -19,8 +19,6 @@ COMMANDS_CHANNEL_ID = 1509381347012120617
 
 # Instagram Bot Setup
 bot = commands.Bot(command_prefix="!")
-intents.message_content = True
-discord_bot = commands.Bot(command_prefix="!", intents=intents)
 # ============================================================
 
 if not os.path.exists(SAVE_PATH):
