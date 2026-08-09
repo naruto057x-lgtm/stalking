@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import traceback
+import random # 👈 تم الإضافة لإعطاء طابع بشري للسكربت
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -15,7 +16,7 @@ import motor.motor_asyncio
 from playwright.async_api import async_playwright
 
 # ==================== تأكيد البدء ====================
-print("🚀 Descord.py script started (Unified Selfbot - Ultimate Design)", flush=True)
+print("🚀 Descord.py script started (Unified Selfbot - Ultimate Design - AntiBan Edition)", flush=True)
 
 # ==================== الإعدادات الأساسية ====================
 USER_TOKEN = os.getenv("USER_TOKEN")
@@ -77,18 +78,22 @@ def embed_to_text(embed: discord.Embed) -> str:
     if embed.fields:
         lines.append("")
         for f in embed.fields:
-            # تنسيق الحقول لتظهر كاقتباس بشكل جميل
             val = str(f.value).replace('\n', '\n> ')
             lines.append(f"**{f.name}**\n> {val}\n")
             
     if embed.footer:
-        # استخدام التنسيق الجانبي الجديد في ديسكورد للفوتر
         lines.append(f"-# {embed.footer.text}")
         
     return "\n".join(lines).strip()
 
+async def human_delay():
+    """محاكاة تأخير بشري قبل إرسال الرسائل (من 1.5 إلى 4 ثواني)"""
+    delay = random.uniform(1.5, 4.0)
+    await asyncio.sleep(delay)
+
 async def send_message(channel_id: int, embed: discord.Embed) -> int:
-    """إرسال الرسالة المنسقة إلى القناة"""
+    """إرسال الرسالة المنسقة إلى القناة مع تأخير بشري"""
+    await human_delay() # 👈 حماية ضد السبام
     url = f"{BASE_API}/channels/{channel_id}/messages"
     payload = {"content": embed_to_text(embed)}
     
@@ -105,6 +110,7 @@ async def send_message(channel_id: int, embed: discord.Embed) -> int:
 
 async def edit_message(channel_id: int, message_id: int, embed: discord.Embed):
     """تعديل رسالة موجودة بنص جديد"""
+    await human_delay()
     url = f"{BASE_API}/channels/{channel_id}/messages/{message_id}"
     payload = {"content": embed_to_text(embed)}
     
@@ -118,14 +124,12 @@ async def edit_message(channel_id: int, message_id: int, embed: discord.Embed):
 
 async def send_message_with_file(channel_id: int, embed: discord.Embed, file_bytes: io.BytesIO, filename: str):
     """إرسال رسالة مع صورة (لقطة الشاشة)"""
+    await human_delay()
     url = f"{BASE_API}/channels/{channel_id}/messages"
     form = aiohttp.FormData()
     
-    # إرفاق النص المنسق
     payload = {"content": embed_to_text(embed)}
     form.add_field("payload_json", json.dumps(payload), content_type="application/json")
-    
-    # إرفاق الصورة
     form.add_field("file", file_bytes.getvalue(), filename=filename, content_type="image/png")
     
     async with aiohttp.ClientSession() as session:
@@ -137,6 +141,7 @@ async def send_message_with_file(channel_id: int, embed: discord.Embed, file_byt
                 logger.error(f"❌ Failed to send file: {resp.status} {text}")
 
 # ==================== إعداد البوت و MongoDB ====================
+# تم تفعيل التخفي ليكون Selfbot سري
 bot = commands.Bot(command_prefix="!", self_bot=True)
 bot.remove_command("help")
 
@@ -153,7 +158,6 @@ except Exception as e:
     logger.error(f"❌ MongoDB initialization failed: {e}")
     sys.exit(1)
 
-# المتغيرات المؤقتة
 active_online_msgs = {}
 active_activity_msgs = {}
 current_activities = {}
@@ -178,6 +182,7 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 device_scale_factor=2,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" # 👈 إضافة User Agent حقيقي
             )
             page = await context.new_page()
             await page.set_extra_http_headers({"Authorization": USER_TOKEN})
@@ -197,7 +202,7 @@ async def on_ready():
 
     embed = discord.Embed(
         title="⚡ Discord Monitor System Online",
-        description=f"**Selfbot:** {bot.user.mention}\nAll systems are fully operational and ready to track.\nUse `!help` in this channel for commands."
+        description=f"**Selfbot:** {bot.user.mention}\nAll systems are fully operational with Anti-Ban active.\nUse `!help` in this channel for commands."
     )
     embed.set_footer(text="System Initialized")
     await send_message(COMMANDS_CHANNEL_ID, embed)
@@ -211,7 +216,7 @@ async def status_check(ctx):
     if ctx.channel.id != COMMANDS_CHANNEL_ID: return
     
     embed = discord.Embed(title="📊 System Status Diagnostics")
-    embed.add_field(name="🌐 Selfbot Connection", value="✅ Connected & Listening", inline=False)
+    embed.add_field(name="🌐 Selfbot Connection", value="✅ Connected & Listening (Stealth Mode)", inline=False)
     
     channels = {
         "Activity Channel": ACTIVITY_CHANNEL_ID,
@@ -397,14 +402,13 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
                 
             await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": now}}, upsert=True)
 
-    # 2. تتبع الأنشطة (الألعاب والبرامج)
+    # 2. تتبع الأنشطة
     before_acts = {act.name: act for act in before.activities if act.type != discord.ActivityType.custom}
     after_acts = {act.name: act for act in after.activities if act.type != discord.ActivityType.custom}
     
     started_acts = set(after_acts.keys()) - set(before_acts.keys())
     ended_acts = set(before_acts.keys()) - set(after_acts.keys())
 
-    # الأنشطة الجديدة
     for name in started_acts:
         start = after_acts[name].start or now
         embed = discord.Embed(
@@ -421,7 +425,6 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
         if user_id not in current_activities: current_activities[user_id] = []
         current_activities[user_id].append({"name": name, "start_time": start})
 
-    # الأنشطة المنتهية
     for name in ended_acts:
         doc = await activity_msgs_col.find_one({"user_id": user_id, "activity_key": name})
         dur_str = "unknown"
@@ -453,15 +456,16 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
 
 # ==================== حلقات عمل الخلفية (Background Loops) ====================
 async def profile_check_loop():
-    """هذه الحلقة تفحص البروفايل كل دقيقة لترصد التغييرات وترسل تنبيه مع السكرين شوت"""
+    """يفحص البروفايل بفترات عشوائية (حوالي دقيقة) لحماية الحساب من الحظر"""
     await bot.wait_until_ready()
     
-    # رسالة بدء النظام
-    startup_embed = discord.Embed(title="🔄 Profile Surveillance Activated", description="Checking target profiles every 60 seconds for modifications.")
+    startup_embed = discord.Embed(title="🔄 Profile Surveillance Activated", description="Checking target profiles stealthily (~ every 60s).")
     await send_message(CHANGES_CHANNEL_ID, startup_embed)
     
     while not bot.is_closed():
         for uid in TARGET_USER_IDS:
+            await asyncio.sleep(random.uniform(1.5, 3.5)) # 👈 تأخير بين فحص كل شخص والتاني
+            
             data = await fetch_user_data(uid)
             if not data: continue
             
@@ -489,21 +493,21 @@ async def profile_check_loop():
                     
                 await profile_cache_col.update_one({"_id": uid}, {"$set": new_cache}, upsert=True)
                 
-                # تجهيز التنبيه النصي
                 embed = discord.Embed(
                     title="⚠️ Profile Update Detected", 
                     description=f"Changes found for <@{uid}>:\n\n" + "\n".join(changes)
                 )
                 embed.set_footer(text=f"Change recorded at {get_egypt_time()}")
                 
-                # تصوير الشاشة وإرسالها
                 screenshot = await take_profile_screenshot(uid)
                 if screenshot.getbuffer().nbytes > 0:
                     await send_message_with_file(CHANGES_CHANNEL_ID, embed, screenshot, f"update_{uid}.png")
                 else:
                     await send_message(CHANGES_CHANNEL_ID, embed)
                     
-        await asyncio.sleep(60)
+        # 👈 السر في الحماية: التكرار عشوائي بين 58 و 85 ثانية بدل 60 ثانية بالضبط
+        cooldown = random.randint(58, 85)
+        await asyncio.sleep(cooldown)
 
 async def screenshot_worker():
     """مدير طابور التقاط الشاشة للأوامر اليدوية"""
@@ -525,6 +529,7 @@ async def screenshot_worker():
 # ==================== التشغيل ====================
 if __name__ == "__main__":
     try:
+        # لو بتستخدم مكتبة discord.py-self، التوكن بتاعك هيشتغل كأنه فاتح من التطبيق
         bot.run(USER_TOKEN)
     except Exception as e:
         logger.critical(f"Fatal error: {e}\n{traceback.format_exc()}")
