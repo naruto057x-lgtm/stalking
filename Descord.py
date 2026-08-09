@@ -44,9 +44,8 @@ def get_egypt_time(dt: datetime = None) -> str:
 # مفيش Intents خالص - discord.py-self لا يدعمها
 
 bot = commands.Bot(command_prefix="!")
-bot.remove_command("help")  # إزالة الأمر المدمج
+bot.remove_command("help")
 
-# متغيرات حالة السيلف بوت
 selfbot_ready = False
 selfbot_error = None
 
@@ -64,7 +63,6 @@ activity_msgs_col = db["activity_messages"]
 last_seen_col = db["last_seen"]
 last_activity_col = db["last_activity"]
 
-# ذاكرة مؤقتة
 active_online_msgs = {}
 active_activity_msgs = {}
 current_activities = {}
@@ -126,7 +124,6 @@ async def on_ready():
 
 @bot.command(name="status")
 async def status_check(ctx):
-    """تشخيص حالة النظام بالكامل"""
     if ctx.channel.id != COMMANDS_CHANNEL_ID:
         return
     bot_status = "✅ Online"
@@ -488,10 +485,9 @@ if selfbot:
             finally:
                 screenshot_queue.task_done()
 
-# ==================== التشغيل الآمن ====================
+# ==================== التشغيل ====================
 async def main():
-    tasks = []
-    tasks.append(asyncio.create_task(bot.start(BOT_TOKEN)))
+    tasks = [asyncio.create_task(bot.start(BOT_TOKEN))]
     if selfbot and USER_TOKEN:
         async def start_selfbot():
             global selfbot_error, selfbot_ready
@@ -506,9 +502,6 @@ async def main():
                 selfbot_error = str(e)
                 selfbot_ready = False
         tasks.append(asyncio.create_task(start_selfbot()))
-    else:
-        logging.warning("Selfbot not started (missing USER_TOKEN or disabled).")
-
     await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
