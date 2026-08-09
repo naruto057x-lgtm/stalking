@@ -12,32 +12,26 @@ import motor.motor_asyncio
 from playwright.async_api import async_playwright
 
 # ==================== الإعدادات الثابتة ====================
-# المتغيرات البيئية (Railway) - فقط توكن البوت وتوكن الحساب الشخصي
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 USER_TOKEN = os.getenv("USER_TOKEN")
 if not BOT_TOKEN or not USER_TOKEN:
     raise ValueError("❌ BOT_TOKEN and USER_TOKEN must be set in environment variables.")
 
-# قائمة الحسابات اللي هنراقبها - أضف أو احذف IDs زي ما تحب
 TARGET_USER_IDS = [
     "1249754394417696801",
     "1378070979401486391"
 ]
 
-# معرفات القنوات (الرومات) اللي هيتبعت فيها الإشعارات والأوامر
-ACTIVITY_CHANNEL_ID = 1535834292502929468      # قناة الأنشطة
-ONLINE_CHANNEL_ID = 1535834924958089286        # قناة الأونلاين/أوفلاين
-CHANGES_CHANNEL_ID = 1509353152724340846       # قناة تغييرات البروفايل
-COMMANDS_CHANNEL_ID = 1509464730509643846      # قناة الأوامر
+ACTIVITY_CHANNEL_ID = 1535834292502929468
+ONLINE_CHANNEL_ID = 1535834924958089286
+CHANGES_CHANNEL_ID = 1509353152724340846
+COMMANDS_CHANNEL_ID = 1509464730509643846
 
-# إعدادات MongoDB
-MONGODB_URI = os.getenv("MONGODB_URI")  # ممكن تحطه كمتغير بيئي أو ثابت هنا
+MONGODB_URI = os.getenv("MONGODB_URI")
 if not MONGODB_URI:
-    # لو مش حابب تستخدم متغير بيئي، حط رابط قاعدة البيانات هنا
     MONGODB_URI = "mongodb://..."
-# ============================================================
 
-# التوقيتات كلها هتبقى بتوقيت مصر
+# ==================== دوال مساعدة ====================
 def get_egypt_time(dt: datetime = None) -> str:
     if dt is None:
         dt = datetime.now(timezone.utc)
@@ -45,16 +39,18 @@ def get_egypt_time(dt: datetime = None) -> str:
     local = dt.astimezone(cairo)
     return local.strftime("%I:%M %p, %A, %B %d, %Y (GMT+3)")
 
-# ==================== إعدادات البوتات ====================
+# ==================== إعداد البوتات ====================
 intents_bot = discord.Intents.default()
 intents_bot.message_content = True
 
 intents_self = discord.Intents.all()
 
 bot = commands.Bot(command_prefix="!", intents=intents_bot)
+bot.remove_command("help")  # إزالة الأمر المدمج عشان نضيف بتاعنا
+
 selfbot = discord.Client(intents=intents_self)
 
-# MongoDB async client
+# MongoDB
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
 db = mongo_client["discord_monitor"]
 profile_cache_col = db["profile_cache"]
@@ -64,14 +60,12 @@ last_seen_col = db["last_seen"]
 last_activity_col = db["last_activity"]
 
 # ذاكرة مؤقتة
-active_online_msgs = {}     # user_id -> discord.Message (الرسالة اللي هيتعملها edit)
-active_activity_msgs = {}   # user_id -> {activity_name: discord.Message}
-current_activities = {}     # user_id -> [dicts]
+active_online_msgs = {}
+active_activity_msgs = {}
+current_activities = {}
 screenshot_queue = asyncio.Queue()
 
-# ==================== وظائف مساعدة ====================
 async def fetch_user_data(user_id: str) -> dict | None:
-    """جلب بيانات البروفايل العامة باستخدام REST API (بصلاحية البوت)"""
     url = f"https://discord.com/api/v10/users/{user_id}"
     headers = {"Authorization": f"Bot {BOT_TOKEN}"}
     async with aiohttp.ClientSession() as session:
@@ -84,7 +78,6 @@ async def fetch_user_data(user_id: str) -> dict | None:
     return None
 
 async def take_profile_screenshot(user_id: str) -> io.BytesIO:
-    """التقاط سكرين شوت حقيقي لصفحة البروفايل باستخدام حساب السيلف بوت"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -92,32 +85,37 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
             device_scale_factor=2,
         )
         page = await context.new_page()
-        # نضيف توكن السيلف بوت عشان الصفحة تفتح كما لو كنا مسجلين دخول
         await page.set_extra_http_headers({"Authorization": USER_TOKEN})
         try:
             await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle")
-            # انتظر تحميل المحتوى الأساسي
             await page.wait_for_selector("div[class*='profile']", timeout=15000)
             screenshot = await page.screenshot(full_page=True)
         except Exception as e:
             logging.error(f"Screenshot failed: {e}")
-            # سكرين شوت بديل (صفحة فارغة) لو فشل
             screenshot = b''
         finally:
             await browser.close()
         return io.BytesIO(screenshot)
 
-# ==================== البوت الأساسي (الأوامر) ====================
-async def get_channel_safe(bot_client, channel_id):
-    """جلب القناة بشكل آمن"""
-    return bot_client.get_channel(channel_id)
-
+# ==================== البوت الأساسي ====================
 @bot.event
 async def on_ready():
     logging.info(f"🤖 Bot logged in as {bot.user}")
+    # إرسال رسالة تأكيد في قناة الأوامر
+    cmd_channel = bot.get_channel(COMMANDS_CHANNEL_ID)
+    if cmd_channel:
+        embed = discord.Embed(
+            title="⚡ Discord Monitor Online",
+            description=f"**Bot:** {bot.user.mention}\n**Status:** Ready to receive commands.\n"
+                        f"All times in Egypt (GMT+3)\n\nUse `!help` to see available commands.",
+            color=0x00FF00,
+            timestamp=datetime.utcnow()
+        )
+        embed.set_footer(text="Radar system activated • Every minute profile check")
+        await cmd_channel.send(embed=embed)
 
 @bot.command(name="help", aliases=["commands"])
-async def _help(ctx):
+async def custom_help(ctx):
     if ctx.channel.id != COMMANDS_CHANNEL_ID:
         return
     embed = discord.Embed(title="📖 Available Commands", color=0x7289DA)
@@ -252,42 +250,13 @@ async def _lastactivity(ctx, user_id: str = None):
     desc = f"🎮 **{name}**\nStarted: {get_egypt_time(start)}\nEnded: {get_egypt_time(end)}\nDuration: {duration}"
     await ctx.send(embed=discord.Embed(title="📜 Last Activity", description=desc, color=0x7289DA))
 
-# ==================== السيلف بوت (المراقبة) ====================
+# ==================== السيلف بوت ====================
 @selfbot.event
 async def on_ready():
     logging.info(f"👤 Selfbot logged in as {selfbot.user}")
-    # تحميل رسايل الأونلاين والأنشطة القديمة عشان نكمل الـ edit لو البوت اتعاد تشغيله
-    await load_message_refs()
-    # بدء مهمة فحص البروفايلات كل دقيقة
+    # تشغيل المراقبة
     selfbot.loop.create_task(profile_check_loop())
-    # تشغيل عامل السكرين شوت
     selfbot.loop.create_task(screenshot_worker())
-
-async def load_message_refs():
-    """استرجاع رسايل الأونلاين والأنشطة من قاعدة البيانات عشان نعرف نعدلهم"""
-    global activity_channel, online_channel
-    activity_channel = selfbot.get_channel(ACTIVITY_CHANNEL_ID)
-    online_channel = selfbot.get_channel(ONLINE_CHANNEL_ID)
-    if not activity_channel or not online_channel:
-        logging.error("❌ Could not find activity or online channels.")
-        return
-    async for doc in online_msgs_col.find():
-        uid = doc["_id"]
-        try:
-            msg = await online_channel.fetch_message(doc["msg_id"])
-            active_online_msgs[uid] = msg
-        except:
-            pass
-    async for doc in activity_msgs_col.find():
-        uid = doc["user_id"]
-        key = doc["activity_key"]
-        try:
-            msg = await activity_channel.fetch_message(doc["msg_id"])
-            if uid not in active_activity_msgs:
-                active_activity_msgs[uid] = {}
-            active_activity_msgs[uid][key] = msg
-        except:
-            pass
 
 @selfbot.event
 async def on_presence_update(before: discord.Member, after: discord.Member):
@@ -300,27 +269,15 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     if not online_channel or not activity_channel:
         return
 
-    # --- تتبع الأونلاين/أوفلاين ---
+    # تتبع الأونلاين/أوفلاين
     if before.status != after.status:
         if after.status == discord.Status.online:
-            embed = discord.Embed(
-                title="🟢 Online",
-                description=f"<@{user_id}> is now online.\n🕒 {get_egypt_time(now)}",
-                color=0x57F287
-            )
+            embed = discord.Embed(title="🟢 Online", description=f"<@{user_id}> is now online.\n🕒 {get_egypt_time(now)}", color=0x57F287)
             embed.set_thumbnail(url=after.display_avatar.url)
             msg = await online_channel.send(embed=embed)
             active_online_msgs[user_id] = msg
-            await online_msgs_col.update_one(
-                {"_id": user_id},
-                {"$set": {"msg_id": msg.id}},
-                upsert=True
-            )
-            await last_seen_col.update_one(
-                {"_id": user_id},
-                {"$set": {"last_online": now}},
-                upsert=True
-            )
+            await online_msgs_col.update_one({"_id": user_id}, {"$set": {"msg_id": msg.id}}, upsert=True)
+            await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_online": now}}, upsert=True)
         elif after.status == discord.Status.offline:
             if user_id in active_online_msgs:
                 old_msg = active_online_msgs.pop(user_id)
@@ -338,13 +295,9 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
                 new_embed.set_thumbnail(url=after.display_avatar.url)
                 await old_msg.edit(embed=new_embed)
                 await online_msgs_col.delete_one({"_id": user_id})
-            await last_seen_col.update_one(
-                {"_id": user_id},
-                {"$set": {"last_offline": now}},
-                upsert=True
-            )
+            await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": now}}, upsert=True)
 
-    # --- تتبع الأنشطة ---
+    # تتبع الأنشطة
     before_acts = {act.name: act for act in before.activities if act.type != discord.ActivityType.custom}
     after_acts = {act.name: act for act in after.activities if act.type != discord.ActivityType.custom}
     started_acts = set(after_acts.keys()) - set(before_acts.keys())
@@ -353,23 +306,13 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     for name in started_acts:
         act = after_acts[name]
         start = act.start or now
-        embed = discord.Embed(
-            title="🎮 Activity Started",
-            description=f"<@{user_id}> started **{act.name}**\n"
-                        f"🕒 Since: {get_egypt_time(start)}",
-            color=0x5865F2
-        )
+        embed = discord.Embed(title="🎮 Activity Started", description=f"<@{user_id}> started **{act.name}**\n🕒 Since: {get_egypt_time(start)}", color=0x5865F2)
         embed.set_thumbnail(url=after.display_avatar.url)
         msg = await activity_channel.send(embed=embed)
         if user_id not in active_activity_msgs:
             active_activity_msgs[user_id] = {}
         active_activity_msgs[user_id][name] = msg
-        await activity_msgs_col.insert_one({
-            "user_id": user_id,
-            "activity_key": name,
-            "msg_id": msg.id,
-            "start_time": start
-        })
+        await activity_msgs_col.insert_one({"user_id": user_id, "activity_key": name, "msg_id": msg.id, "start_time": start})
         if user_id not in current_activities:
             current_activities[user_id] = []
         current_activities[user_id].append({"name": name, "start_time": start})
@@ -396,24 +339,21 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
                 await activity_msgs_col.delete_one({"user_id": user_id, "activity_key": name})
                 await last_activity_col.update_one(
                     {"_id": user_id},
-                    {"$set": {
-                        "activity_name": name,
-                        "start": start_time,
-                        "end": end_time,
-                        "duration": dur_str
-                    }},
+                    {"$set": {"activity_name": name, "start": start_time, "end": end_time, "duration": dur_str}},
                     upsert=True
                 )
         if user_id in current_activities:
             current_activities[user_id] = [a for a in current_activities[user_id] if a["name"] != name]
 
 async def profile_check_loop():
-    """فحص البروفايل كل دقيقة وإرسال التغييرات مع سكرين شوت"""
     await selfbot.wait_until_ready()
     changes_channel = selfbot.get_channel(CHANGES_CHANNEL_ID)
     if not changes_channel:
         logging.error("❌ Changes channel not found.")
         return
+    # رسالة بداية مراقبة البروفايلات
+    embed = discord.Embed(title="🔄 Profile Monitoring Started", description="Checking profiles every minute for changes.", color=0x00FF00)
+    await changes_channel.send(embed=embed)
     while not selfbot.is_closed():
         for uid in TARGET_USER_IDS:
             data = await fetch_user_data(uid)
@@ -445,7 +385,6 @@ async def profile_check_loop():
                     timestamp=datetime.utcnow()
                 )
                 embed.set_footer(text=f"Detected at {get_egypt_time()}")
-                # التقاط سكرين شوت للبروفايل بعد التغيير
                 screenshot = await take_profile_screenshot(uid)
                 file = discord.File(screenshot, filename=f"profile_{uid}.png")
                 embed.set_image(url=f"attachment://profile_{uid}.png")
@@ -453,7 +392,6 @@ async def profile_check_loop():
         await asyncio.sleep(60)
 
 async def screenshot_worker():
-    """معالجة طلبات السكرين شوت اللي جاية من أوامر البوت"""
     while True:
         ctx, user_id = await screenshot_queue.get()
         try:
@@ -468,9 +406,7 @@ async def screenshot_worker():
         finally:
             screenshot_queue.task_done()
 
-# ==================== التشغيل ====================
 async def main():
-    # تشغيل السيلف بوت والبوت معًا
     await asyncio.gather(
         selfbot.start(USER_TOKEN),
         bot.start(BOT_TOKEN)
