@@ -3,7 +3,9 @@ import time
 import os
 import discord
 from discord.ext import commands, tasks
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import threading
+from zoneinfo import ZoneInfo  # للتوقيتات (Python 3.9+)
 
 # ==================== الإعدادات الأساسية ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -12,14 +14,15 @@ if not BOT_TOKEN:
 
 TARGET_USER_IDS = [
     "1249754394417696801",
-    "1378070979401486391"   # الحساب الجديد اللي أنت كاتبه
-]  
+    "1378070979401486391"   # أضف أي ID إضافي هنا
+]
 WEBHOOK_URL = "https://discord.com/api/webhooks/1509353177663803522/OMdWhlsdCCU0rlTrVs-pWGt0Vhqnb81PYrJ9Q0IEOlhjs0ackASANAB59YOwfEuU-Bg7"
 COMMANDS_CHANNEL_ID = 1509464730509643846
 # ============================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.presences = True          # ضروري لتتبع الأونلاين/أوفلاين
 discord_bot = commands.Bot(command_prefix="!", intents=intents)
 
 headers = {
@@ -27,16 +30,32 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# كاش لحفظ الحالة القديمة ومقارنتها بالتحديثات الجديدة
-profile_cache = {
-    "username": None,
-    "global_name": None,
-    "bio": None,
-    "avatar": None,
-    "banner": None,
-    "clan_tag": None,
-    "avatar_decoration": None
-}
+# كاش البروفايل لكل حساب
+profile_cache = {}  # {user_id: {data...}}
+
+# تتبع الأونلاين/أوفلاين لكل حساب (بيانات الجلسات)
+presence_tracker = {}  # {user_id: {"last_online": datetime, "last_offline": datetime, "offline_start": datetime}}
+
+def get_cache(user_id):
+    if user_id not in profile_cache:
+        profile_cache[user_id] = {
+            "username": None,
+            "global_name": None,
+            "bio": None,
+            "avatar": None,
+            "banner": None,
+            "clan_tag": None,
+            "avatar_decoration": None
+        }
+    return profile_cache[user_id]
+
+def get_egypt_time(dt: datetime = None):
+    """يحول أي وقت إلى توقيت مصر UTC+3"""
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    cairo_tz = ZoneInfo("Africa/Cairo")
+    local_dt = dt.astimezone(cairo_tz)
+    return local_dt.strftime("%I:%M %p, %A, %B %d, %Y (GMT+3)")
 
 def get_discord_user_data(user_id):
     url = f"https://discord.com/api/v10/users/{user_id}"
@@ -45,26 +64,28 @@ def get_discord_user_data(user_id):
         if res.status_code == 200:
             return res.json()
         else:
-            print(f"❌ فشل في جلب البيانات من ديسكورد. كود الخطأ: {res.status_code}")
+            print(f"❌ Failed to fetch data for {user_id}. Status code: {res.status_code}")
     except Exception as e:
-        print(f"❌ خطأ في الاتصال بالسيرفر: {e}")
+        print(f"❌ Connection error: {e}")
     return None
 
-def send_to_webhook(user_data, user_id, changes_made=None):
+def send_to_webhook(user_data, user_id, changes_made=None, event_type="profile"):
     username = user_data.get("username", "Unknown")
-    global_name = user_data.get("global_name") or "لا يوجد اسم مستعار"
-    bio_text = user_data.get("bio") or "*هذا الشخص مش كاتب بايو في بروفايله*"
+    global_name = user_data.get("global_name") or "No display name"
+    bio_text = user_data.get("bio") or "*This user has no bio.*"
     accent_color = user_data.get("accent_color") or 0x7289DA
-    
-    # 1. حساب تاريخ إنشاء الحساب
+    now_str = get_egypt_time()
+
+    # تاريخ إنشاء الحساب
     try:
         snowflake_id = int(user_id)
         timestamp = ((snowflake_id >> 22) + 1420070400000) / 1000
-        creation_date = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime('%Y-%m-%d %I:%M:%S %p UTC')
+        creation_date = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        creation_str = get_egypt_time(creation_date)
     except:
-        creation_date = "غير قادر على الحساب"
+        creation_str = "Unable to calculate"
 
-    # 2. روابط البروفايل والبانر
+    # أفاتار
     avatar_hash = user_data.get("avatar")
     if avatar_hash:
         ext = "gif" if avatar_hash.startswith("a_") else "png"
@@ -72,54 +93,58 @@ def send_to_webhook(user_data, user_id, changes_made=None):
     else:
         avatar_url = "https://cdn.discordapp.com/embed/avatars/0.png"
 
+    # بانر
     banner_hash = user_data.get("banner")
-    banner_url = "https://images.jpg"
     if banner_hash:
         ext = "gif" if banner_hash.startswith("a_") else "png"
         banner_url = f"https://cdn.discordapp.com/banners/{user_id}/{banner_hash}.{ext}?size=1024"
-        banner_status = f"[اضغط هنا لفتح البانر]({banner_url})"
+        banner_status = f"[Click to open banner]({banner_url})"
     else:
-        banner_status = "*الشخص مش حاطط صورة بانر*"
+        banner_url = None
+        banner_status = "*No banner set*"
 
-    # 3. بيانات الـ Clan
+    # Clan
     clan_data = user_data.get("clan")
     if clan_data:
-        clan_tag = clan_data.get("tag", "بدون تاغ")
-        clan_id = clan_data.get("identity_guild_id") or clan_data.get("guild_id") or "غير معروف"
+        clan_tag = clan_data.get("tag", "No tag")
+        clan_id = clan_data.get("identity_guild_id") or clan_data.get("guild_id") or "Unknown"
         clan_status = f"**₊ {clan_tag}**\n🆔 **ID:** `{clan_id}`"
     else:
-        clan_status = "*الشخص ده مش مشترك في أي Clan حالياً*"
+        clan_status = "*Not in any Clan*"
 
-    # 4. بيانات الديكوريشن
+    # Decoration
     deco_data = user_data.get("avatar_decoration_data")
     if deco_data:
         asset_hash = deco_data.get("asset")
         deco_url = f"https://cdn.discordapp.com/avatar-decorations/{asset_hash}.png"
-        deco_status = f"[اضغط هنا لمعاينة الديكوريشن]({deco_url})"
+        deco_status = f"[Click to preview decoration]({deco_url})"
     else:
-        deco_status = "*الشخص مش حاطط أي ديكوريشن على الأفاتار*"
+        deco_status = "*No avatar decoration*"
+
+    # بناء الـ Embed
+    if event_type == "profile_update":
+        title = f"🔥 Profile Change Detected for: @{username}"
+        description = f"**Changes spotted instantly:**\n{changes_made}\n\n🕒 Detected at: {now_str}"
+        embed_color = 0xFF0000
+    elif event_type == "presence":
+        title = f"👀 Online/Offline Update for: @{username}"
+        description = changes_made if changes_made else "Status changed"
+        embed_color = 0x00FF00 if "online" in changes_made.lower() else 0x808080
+    else:  # بدء المراقبة
+        title = f"⚙️ Monitoring Started for: @{username}"
+        description = f"Radar is now active 24/7. Profile will be checked every minute.\n🕒 Started at: {now_str}"
+        embed_color = accent_color
 
     fields = [
-        {"name": "👤 Username:", "value": f"`{username}`", "inline": True},
-        {"name": "Name (Global Name):", "value": global_name, "inline": True},
-        {"name": "🆔 User ID:", "value": f"`{user_id}`", "inline": True},
-        {"name": "📅 تاريخ إنشاء الحساب:", "value": f"`{creation_date}`", "inline": False},
-        {"name": "🛡️ الـ Clan الحالي (Guild Tag):", "value": clan_status, "inline": False},
-        {"name": "✨ زينة الأفاتار (Decoration):", "value": deco_status, "inline": False},
-        {"name": "📝 البايو (Bio) بالكامل:", "value": bio_text, "inline": False},
-        {"name": "🖼️ رابط صورة البانر:", "value": banner_status, "inline": False}
+        {"name": "👤 Username", "value": f"`{username}`", "inline": True},
+        {"name": "Display Name", "value": global_name, "inline": True},
+        {"name": "🆔 User ID", "value": f"`{user_id}`", "inline": True},
+        {"name": "📅 Account Creation Date", "value": f"`{creation_str}`", "inline": False},
+        {"name": "🛡️ Current Clan (Guild Tag)", "value": clan_status, "inline": False},
+        {"name": "✨ Avatar Decoration", "value": deco_status, "inline": False},
+        {"name": "📝 Full Bio", "value": bio_text, "inline": False},
+        {"name": "🖼️ Banner Link", "value": banner_status, "inline": False}
     ]
-
-    # لو مفيش تغييرات يبقا ده الإشعار المبدئي للتشغيل
-    title = f"⚙️ تم بدء مراقبة الحساب بنجاح: @{username}"
-    description = "الرادار شغال الآن 24 ساعة وهيتم فحص أي تغيير كل دقيقة تلقائياً."
-    embed_color = accent_color
-
-    # لو فيه لستة تغييرات واصلة للـ دالة
-    if changes_made:
-        title = f"🔥 قفشة! تم رصد تغيير جديد في بروفايل: @{username}"
-        description = f"**التحديثات التي تم رصدها فوراً:**\n{changes_made}"
-        embed_color = 0xFF0000  # قلب اللون أحمر عشان الإشعار يبان خطر وجامد في السيرفر
 
     payload = {
         "embeds": [{
@@ -127,10 +152,10 @@ def send_to_webhook(user_data, user_id, changes_made=None):
             "description": description,
             "color": embed_color,
             "thumbnail": {"url": avatar_url},
-            "image": {"url": banner_url if banner_hash else None},
+            "image": {"url": banner_url} if banner_url else {},
             "fields": fields,
             "footer": {
-                "text": "نظام الرادار الذكي المستمر • ديسكورد",
+                "text": "Advanced Discord Radar System",
                 "icon_url": "https://cdn.discordapp.com/embed/avatars/4.png"
             },
             "timestamp": datetime.utcnow().isoformat() + "Z"
@@ -139,244 +164,261 @@ def send_to_webhook(user_data, user_id, changes_made=None):
 
     requests.post(WEBHOOK_URL, json=payload)
 
+# ============ مراقبة البروفايل (REST) ============
 def start_radar():
-    print("🔍 جاري الاتصال المبدئي لتهيئة الكاش وسحب البيانات الحالية...")
-    initial_data = get_discord_user_data(TARGET_USER_ID)
-    
-    if not initial_data:
-        print("❌ فشل تشغيل الرادار. تأكد من صلاحية التوكن والـ ID الحساب.")
+    print("🔍 Initializing caches and starting monitoring for all accounts...")
+    for uid in TARGET_USER_IDS:
+        data = get_discord_user_data(uid)
+        if data:
+            cache = get_cache(uid)
+            cache["username"] = data.get("username")
+            cache["global_name"] = data.get("global_name")
+            cache["bio"] = data.get("bio")
+            cache["avatar"] = data.get("avatar")
+            cache["banner"] = data.get("banner")
+            cache["clan_tag"] = data.get("clan", {}).get("tag") if data.get("clan") else None
+            cache["avatar_decoration"] = data.get("avatar_decoration_data", {}).get("asset") if data.get("avatar_decoration_data") else None
+            send_to_webhook(data, uid)  # إشعار بدء المراقبة
+        else:
+            print(f"❌ Failed to initialize {uid}")
+
+    print("🚀 Radar is running in the background... checking every minute.")
+    while True:
+        time.sleep(60)
+        for uid in TARGET_USER_IDS:
+            current_data = get_discord_user_data(uid)
+            if not current_data:
+                continue
+            cache = get_cache(uid)
+            changes = []
+
+            current_username = current_data.get("username")
+            if current_username != cache["username"]:
+                changes.append(f"🔹 **Username:** `{cache['username']}` → `{current_username}`")
+                cache["username"] = current_username
+
+            current_global = current_data.get("global_name")
+            if current_global != cache["global_name"]:
+                changes.append(f"🔹 **Display Name:** `{cache['global_name']}` → `{current_global}`")
+                cache["global_name"] = current_global
+
+            current_bio = current_data.get("bio")
+            if current_bio != cache["bio"]:
+                changes.append("📝 **Bio has been modified.**")
+                cache["bio"] = current_bio
+
+            current_avatar = current_data.get("avatar")
+            if current_avatar != cache["avatar"]:
+                changes.append("🖼️ **Avatar changed!**")
+                cache["avatar"] = current_avatar
+
+            current_banner = current_data.get("banner")
+            if current_banner != cache["banner"]:
+                changes.append("🌌 **Banner image updated.**")
+                cache["banner"] = current_banner
+
+            current_clan_tag = current_data.get("clan", {}).get("tag") if current_data.get("clan") else None
+            if current_clan_tag != cache["clan_tag"]:
+                changes.append(f"🛡️ **Clan Tag:** `{cache['clan_tag']}` → `{current_clan_tag}`")
+                cache["clan_tag"] = current_clan_tag
+
+            current_deco = current_data.get("avatar_decoration_data", {}).get("asset") if current_data.get("avatar_decoration_data") else None
+            if current_deco != cache["avatar_decoration"]:
+                changes.append("✨ **Avatar Decoration changed.**")
+                cache["avatar_decoration"] = current_deco
+
+            if changes:
+                changes_string = "\n".join(changes)
+                print(f"🔥 Updates for {uid}: {changes_string}")
+                send_to_webhook(current_data, uid, changes_made=changes_string, event_type="profile_update")
+
+# ============ مراقبة الأونلاين/أوفلاين ============
+@discord_bot.event
+async def on_presence_update(before: discord.Member, after: discord.Member):
+    user_id = str(after.id)
+    if user_id not in TARGET_USER_IDS:
+        return  # الشخص مش ضمن قائمة المراقبة
+
+    old_status = before.status
+    new_status = after.status
+    now_utc = datetime.now(timezone.utc)
+
+    if user_id not in presence_tracker:
+        presence_tracker[user_id] = {
+            "last_online": now_utc if new_status == discord.Status.online else None,
+            "last_offline": now_utc if new_status == discord.Status.offline else None,
+            "offline_start": now_utc if new_status == discord.Status.offline else None
+        }
         return
 
-    # حفظ الداتا الحالية في الكاش لأول مرة
-    profile_cache["username"] = initial_data.get("username")
-    profile_cache["global_name"] = initial_data.get("global_name")
-    profile_cache["bio"] = initial_data.get("bio")
-    profile_cache["avatar"] = initial_data.get("avatar")
-    profile_cache["banner"] = initial_data.get("banner")
-    profile_cache["clan_tag"] = initial_data.get("clan", {}).get("tag") if initial_data.get("clan") else None
-    profile_cache["avatar_decoration"] = initial_data.get("avatar_decoration_data", {}).get("asset") if initial_data.get("avatar_decoration_data") else None
+    tracker = presence_tracker[user_id]
 
-    # إرسال كارت البروفايل الحالي فوراً للإعلان عن بدء الرادار
-    send_to_webhook(initial_data, TARGET_USER_ID)
-    print("🚀 الرادار مستقر وشغال في الخلفية الآن.. الفحص مستمر كل دقيقة!")
+    # الشخص دخل أونلاين
+    if new_status == discord.Status.online and old_status != discord.Status.online:
+        offline_duration = None
+        if tracker.get("offline_start"):
+            offline_duration = (now_utc - tracker["offline_start"]).total_seconds()
+            tracker["offline_start"] = None
 
-    while True:
-        time.sleep(60)  # الفحص دقيقة بدقيقة
-        current_data = get_discord_user_data(TARGET_USER_ID)
-        if not current_data:
-            continue
+        if offline_duration is not None:
+            if offline_duration > 600:  # أكثر من 10 دقايق
+                msg = (
+                    f"🟢 **User came back online** after being offline for {int(offline_duration//60)} min {int(offline_duration%60)} sec.\n"
+                    f"⏱️ This indicates **Discord was fully closed**.\n"
+                    f"🕒 Online at: {get_egypt_time(now_utc)}"
+                )
+            else:
+                msg = (
+                    f"🟢 **User came back online** after a brief offline period ({int(offline_duration)} sec).\n"
+                    f"📌 This is probably the same session (connection hiccup).\n"
+                    f"🕒 Online at: {get_egypt_time(now_utc)}"
+                )
+        else:
+            msg = f"🟢 **User is now online**\n🕒 Online at: {get_egypt_time(now_utc)}"
+        send_presence_webhook(after, msg)
 
-        detected_changes = []
+    # الشخص دخل أوفلاين
+    elif new_status == discord.Status.offline and old_status != discord.Status.offline:
+        tracker["offline_start"] = now_utc
+        msg = f"🔴 **User went offline**\n🕒 Offline at: {get_egypt_time(now_utc)}"
+        send_presence_webhook(after, msg)
 
-        # 1. قنص تغيير اليوزرنيم
-        current_username = current_data.get("username")
-        print(f"[DEBUG] Username: {current_username} vs {profile_cache['username']}")
-        if current_username != profile_cache["username"]:
-            detected_changes.append(f"🔹 **تغيير اليوزرنيم:** من `{profile_cache['username']}` إلى `{current_username}`")
-            print(f"✅ تم رصد تغيير في Username")
-            profile_cache["username"] = current_username
+    # تحديث آخر أونلاين / أوفلاين
+    if new_status == discord.Status.online:
+        tracker["last_online"] = now_utc
+    elif new_status == discord.Status.offline:
+        tracker["last_offline"] = now_utc
 
-        # 2. قنص تغيير الـ Global Name
-        current_global_name = current_data.get("global_name")
-        print(f"[DEBUG] Global Name: {current_global_name} vs {profile_cache['global_name']}")
-        if current_global_name != profile_cache["global_name"]:
-            detected_changes.append(f"🔹 **تغيير الاسم المستعار:** من `{profile_cache['global_name']}` إلى `{current_global_name}`")
-            print(f"✅ تم رصد تغيير في Global Name")
-            profile_cache["global_name"] = current_global_name
+def send_presence_webhook(member: discord.Member, message):
+    """إرسال Webhook لتحديثات الحضور"""
+    payload = {
+        "embeds": [{
+            "title": f"👀 Presence Update: @{member.name}",
+            "description": message,
+            "color": 0x7289DA,
+            "footer": {
+                "text": "Advanced Discord Radar System • Presence Tracking"
+            },
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }]
+    }
+    requests.post(WEBHOOK_URL, json=payload)
 
-        # 3. قنص تغيير البايو كاملاً
-        current_bio = current_data.get("bio")
-        print(f"[DEBUG] Bio: {current_bio} vs {profile_cache['bio']}")
-        if current_bio != profile_cache["bio"]:
-            detected_changes.append("📝 **قام بتعديل البايو (Bio) الخاص ببروفايله الحساب!**")
-            print(f"✅ تم رصد تغيير في Bio")
-            profile_cache["bio"] = current_bio
-
-        # 4. قنص قفشة تغيير صورة البروفايل (الأفاتار)
-        current_avatar = current_data.get("avatar")
-        print(f"[DEBUG] Avatar: {current_avatar} vs {profile_cache['avatar']}")
-        if current_avatar != profile_cache["avatar"]:
-            detected_changes.append("🖼️ **قفشة! الشخص قام بتغيير صورة البروفايل (Avatar) الحالية!**")
-            print(f"✅ تم رصد تغيير في Avatar")
-            profile_cache["avatar"] = current_avatar
-
-        # 5. قنص تغيير البانر
-        current_banner = current_data.get("banner")
-        print(f"[DEBUG] Banner: {current_banner} vs {profile_cache['banner']}")
-        if current_banner != profile_cache["banner"]:
-            detected_changes.append("🌌 **تم رصد تغيير في صورة البانر (Banner) الخلفية!**")
-            print(f"✅ تم رصد تغيير في Banner")
-            profile_cache["banner"] = current_banner
-
-        # 6. قنص خروج أو دخول كلان (Guild Tag)
-        current_clan_tag = current_data.get("clan", {}).get("tag") if current_data.get("clan") else None
-        print(f"[DEBUG] Clan Tag: {current_clan_tag} vs {profile_cache['clan_tag']}")
-        if current_clan_tag != profile_cache["clan_tag"]:
-            detected_changes.append(f"🛡️ **تعديل الـ Clan Tag:** من `{profile_cache['clan_tag']}` إلى `{current_clan_tag}`")
-            print(f"✅ تم رصد تغيير في Clan Tag")
-            profile_cache["clan_tag"] = current_clan_tag
-
-        # 7. قنص تغيير زينة الأفاتار (Decoration)
-        current_deco = current_data.get("avatar_decoration_data", {}).get("asset") if current_data.get("avatar_decoration_data") else None
-        print(f"[DEBUG] Decoration: {current_deco} vs {profile_cache['avatar_decoration']}")
-        if current_deco != profile_cache["avatar_decoration"]:
-            detected_changes.append("✨ **قام بتغيير أو تحديث زينة الأفاتار (Avatar Decoration)!**")
-            print(f"✅ تم رصد تغيير في Decoration")
-            profile_cache["avatar_decoration"] = current_deco
-
-        # إذا لستة التغييرات فيها داتا، ابعت التنبيه فوراً
-        if detected_changes:
-            changes_string = "\n".join(detected_changes)
-            print("🔥 تم رصد تحديثات جديدة! جاري إرسال التنبيه الفوري...")
-            send_to_webhook(current_data, TARGET_USER_ID, changes_made=changes_string)
-
+# ============ أوامر البوت ============
 @discord_bot.event
 async def on_ready():
     print(f"\n{'='*70}")
     print(f"🤖 Discord Monitor Bot Ready as: {discord_bot.user.name}")
     print(f"{'='*70}\n")
-    radar_monitor_loop.start()
 
 @discord_bot.command(name="commands")
 async def cmd_commands(ctx):
-    """عرض جميع أوامر رادار ديسكورد"""
     if ctx.channel.id != COMMANDS_CHANNEL_ID:
         return
-    
-    embed = discord.Embed(title="📖 قائمة أوامر رادار ديسكورد (Discord Monitor Commands)", color=0x7289DA)
-    
+
+    embed = discord.Embed(title="📖 Discord Monitor Commands", color=0x7289DA)
     embed.add_field(
-        name="👤 !profile",
-        value="عرض بيانات البروفايل الحالية للحساب المراقب\n**مثال:** `!profile`",
+        name="👤 !profile [user_id]",
+        value="Displays the current profile of a monitored user. If no ID is given, shows the first target.\n"
+              "**Example:** `!profile 1249754394417696801`",
         inline=False
     )
-    
     embed.add_field(
-        name="🔔 التنبيهات التلقائية",
-        value="**النظام يرسل إشعارات تلقائية متى:**\n"
-              "📝 **تعديل البايو** - إشعار فوري\n"
-              "🖼️ **تغيير صورة البروفايل** - إشعار فوري مع الصورة الجديدة\n"
-              "🌌 **تغيير صورة البانر** - إشعار فوري\n"
-              "👤 **تغيير الاسم المستعار** - إشعار فوري\n"
-              "🛡️ **الدخول/الخروج من Clan** - إشعار فوري\n"
-              "✨ **تغيير زينة الأفاتار** - إشعار فوري",
+        name="🔔 Automatic Alerts",
+        value="The system sends instant alerts when:\n"
+              "📝 **Bio modified**\n"
+              "🖼️ **Avatar changed**\n"
+              "🌌 **Banner changed**\n"
+              "👤 **Display name changed**\n"
+              "🛡️ **Joined/Left a Clan**\n"
+              "✨ **Avatar decoration changed**\n"
+              "🟢🔴 **Online/Offline status changes** (requires shared server & presence intent)\n",
         inline=False
     )
-    
-    embed.set_footer(text="الرادار يفحص البروفايل كل دقيقة تلقائياً 🔍")
+    embed.set_footer(text="Radar checks profiles every minute • Presence tracking is real-time")
     await ctx.send(embed=embed)
 
 @discord_bot.command(name="profile")
-async def cmd_profile(ctx):
-    """عرض بيانات البروفايل الحالية"""
+async def cmd_profile(ctx, user_id: str = None):
     if ctx.channel.id != COMMANDS_CHANNEL_ID:
         return
-    
-    user_data = get_discord_user_data(TARGET_USER_ID)
-    if not user_data:
-        await ctx.send("❌ تعذر جلب بيانات البروفايل!")
-        return
-    
-    # إنشاء نفس البيانات والـ embed مباشرة في هذه الروم دون الاعتماد على webhook
-    username = user_data.get("username", "Unknown")
-    global_name = user_data.get("global_name") or "لا يوجد اسم مستعار"
-    bio_text = user_data.get("bio") or "*هذا الشخص مش كاتب بايو في بروفايله*"
-    accent_color = user_data.get("accent_color") or 0x7289DA
-    
-    # حساب تاريخ إنشاء الحساب
-    try:
-        snowflake_id = int(TARGET_USER_ID)
-        timestamp = ((snowflake_id >> 22) + 1420070400000) / 1000
-        creation_date = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime('%Y-%m-%d %I:%M:%S %p UTC')
-    except:
-        creation_date = "غير قادر على الحساب"
 
-    # روابط البروفايل والبانر
+    if not user_id:
+        user_id = TARGET_USER_IDS[0]
+    elif user_id not in TARGET_USER_IDS:
+        await ctx.send("❌ This ID is not in the monitoring list.")
+        return
+
+    user_data = get_discord_user_data(user_id)
+    if not user_data:
+        await ctx.send("❌ Failed to fetch profile data!")
+        return
+
+    username = user_data.get("username", "Unknown")
+    global_name = user_data.get("global_name") or "No display name"
+    bio_text = user_data.get("bio") or "*This user has no bio.*"
+    accent_color = user_data.get("accent_color") or 0x7289DA
+    creation_str = "Unable to calculate"
+    try:
+        snowflake_id = int(user_id)
+        timestamp = ((snowflake_id >> 22) + 1420070400000) / 1000
+        creation_date = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        creation_str = get_egypt_time(creation_date)
+    except:
+        pass
+
     avatar_hash = user_data.get("avatar")
-    if avatar_hash:
-        ext = "gif" if avatar_hash.startswith("a_") else "png"
-        avatar_url = f"https://cdn.discordapp.com/avatars/{TARGET_USER_ID}/{avatar_hash}.{ext}?size=1024"
-    else:
-        avatar_url = "https://cdn.discordapp.com/embed/avatars/0.png"
+    avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.{'gif' if avatar_hash.startswith('a_') else 'png'}?size=1024" if avatar_hash else "https://cdn.discordapp.com/embed/avatars/0.png"
 
     banner_hash = user_data.get("banner")
     if banner_hash:
         ext = "gif" if banner_hash.startswith("a_") else "png"
-        banner_url = f"https://cdn.discordapp.com/banners/{TARGET_USER_ID}/{banner_hash}.{ext}?size=1024"
-        banner_status = f"[اضغط هنا لفتح البانر]({banner_url})"
+        banner_url = f"https://cdn.discordapp.com/banners/{user_id}/{banner_hash}.{ext}?size=1024"
+        banner_status = f"[Click to open banner]({banner_url})"
     else:
-        banner_status = "*الشخص مش حاطط صورة بانر*"
+        banner_url = None
+        banner_status = "*No banner set*"
 
-    # بيانات الـ Clan
     clan_data = user_data.get("clan")
     if clan_data:
-        clan_tag = clan_data.get("tag", "بدون تاغ")
-        clan_id = clan_data.get("identity_guild_id") or clan_data.get("guild_id") or "غير معروف"
+        clan_tag = clan_data.get("tag", "No tag")
+        clan_id = clan_data.get("identity_guild_id") or clan_data.get("guild_id") or "Unknown"
         clan_status = f"**₊ {clan_tag}**\n🆔 **ID:** `{clan_id}`"
     else:
-        clan_status = "*الشخص ده مش مشترك في أي Clan حالياً*"
+        clan_status = "*Not in any Clan*"
 
-    # بيانات الديكوريشن
     deco_data = user_data.get("avatar_decoration_data")
     if deco_data:
         asset_hash = deco_data.get("asset")
         deco_url = f"https://cdn.discordapp.com/avatar-decorations/{asset_hash}.png"
-        deco_status = f"[اضغط هنا لمعاينة الديكوريشن]({deco_url})"
+        deco_status = f"[Click to preview decoration]({deco_url})"
     else:
-        deco_status = "*الشخص مش حاطط أي ديكوريشن على الأفاتار*"
+        deco_status = "*No avatar decoration*"
 
-    # إنشاء الـ Embed مباشرة في الروم
     embed = discord.Embed(
-        title=f"👤 بيانات البروفايل الحالية: @{username}",
-        description="تفاصيل شاملة عن حساب الهدف",
+        title=f"👤 Profile: @{username}",
+        description=f"Full profile details (retrieved at {get_egypt_time()})",
         color=accent_color,
         timestamp=datetime.utcnow()
     )
-    
     embed.set_thumbnail(url=avatar_url)
     if banner_hash:
         embed.set_image(url=banner_url)
-    
+
     embed.add_field(name="👤 Username", value=f"`{username}`", inline=True)
-    embed.add_field(name="Name (Global Name)", value=global_name, inline=True)
-    embed.add_field(name="🆔 User ID", value=f"`{TARGET_USER_ID}`", inline=True)
-    embed.add_field(name="📅 تاريخ إنشاء الحساب", value=f"`{creation_date}`", inline=False)
-    embed.add_field(name="🛡️ الـ Clan الحالي (Guild Tag)", value=clan_status, inline=False)
-    embed.add_field(name="✨ زينة الأفاتار (Decoration)", value=deco_status, inline=False)
-    embed.add_field(name="📝 البايو (Bio) بالكامل", value=bio_text, inline=False)
-    embed.add_field(name="🖼️ رابط صورة البانر", value=banner_status, inline=False)
-    
-    embed.set_footer(text="نظام الرادار الذكي المستمر • ديسكورد | تم الجلب الآن")
-    
+    embed.add_field(name="Display Name", value=global_name, inline=True)
+    embed.add_field(name="🆔 User ID", value=f"`{user_id}`", inline=True)
+    embed.add_field(name="📅 Account Creation Date", value=f"`{creation_str}`", inline=False)
+    embed.add_field(name="🛡️ Current Clan", value=clan_status, inline=False)
+    embed.add_field(name="✨ Avatar Decoration", value=deco_status, inline=False)
+    embed.add_field(name="📝 Bio", value=bio_text, inline=False)
+    embed.add_field(name="🖼️ Banner", value=banner_status, inline=False)
+
+    embed.set_footer(text="Advanced Discord Radar System • Instant fetch")
     await ctx.send(embed=embed)
 
-async def radar_monitor_loop_task():
-    """حلقة المراقبة المستمرة في الخلفية"""
-    await discord_bot.wait_until_ready()
-    start_radar()
-
-def main():
-    """تشغيل البوت"""
-    import asyncio
-    # تشغيل حلقة المراقبة في الخلفية
-    asyncio.create_task(radar_monitor_loop_task())
-    discord_bot.run(BOT_TOKEN)
-
-@tasks.loop(minutes=1)
-async def radar_monitor_loop():
-    """مراقبة محدثة كل دقيقة"""
-    pass
-
 if __name__ == "__main__":
-    print("🚀 إطلاق نظام مراقبة ديسكورد المتقدم...")
-    
-    # تشغيل البوت والرادار معاً
-    import asyncio
-    import threading
-    
-    # تشغيل الرادار في خيط منفصل
+    print("🚀 Launching Advanced Discord Monitor...")
     radar_thread = threading.Thread(target=start_radar, daemon=True)
     radar_thread.start()
-    
-    # تشغيل البوت الرئيسي
     discord_bot.run(BOT_TOKEN)
