@@ -41,21 +41,17 @@ def get_egypt_time(dt: datetime = None) -> str:
     return local.strftime("%I:%M %p, %A, %B %d, %Y (GMT+3)")
 
 # ==================== إعداد البوتات ====================
-intents_bot = discord.Intents.default()
-intents_bot.message_content = True
+# مفيش Intents خالص - discord.py-self لا يدعمها
 
-bot = commands.Bot(command_prefix="!", intents=intents_bot)
+bot = commands.Bot(command_prefix="!")
 bot.remove_command("help")  # إزالة الأمر المدمج
 
-# متغيرات حالة السيلف بوت (علشان نعرف نفحصها من البوت الأساسي)
+# متغيرات حالة السيلف بوت
 selfbot_ready = False
 selfbot_error = None
-selfbot_instance = None
 
 if USER_TOKEN:
-    intents_self = discord.Intents.all()
-    selfbot = discord.Client(intents=intents_self)
-    selfbot_instance = selfbot
+    selfbot = discord.Client()  # بدون Intents
 else:
     selfbot = None
 
@@ -124,7 +120,7 @@ async def on_ready():
                         f"Use `!status` for full diagnostics.\n"
                         f"All times in Egypt (GMT+3)",
             color=0x00FF00,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         await cmd_channel.send(embed=embed)
 
@@ -133,9 +129,7 @@ async def status_check(ctx):
     """تشخيص حالة النظام بالكامل"""
     if ctx.channel.id != COMMANDS_CHANNEL_ID:
         return
-    # فحص البوت
     bot_status = "✅ Online"
-    # فحص السيلف بوت
     if USER_TOKEN:
         if selfbot_ready:
             self_status = "✅ Connected"
@@ -144,7 +138,6 @@ async def status_check(ctx):
     else:
         self_status = "⚠️ Not configured (missing USER_TOKEN)"
 
-    # فحص القنوات (باستخدام البوت الأساسي)
     channels = {
         "Activity": bot.get_channel(ACTIVITY_CHANNEL_ID),
         "Online": bot.get_channel(ONLINE_CHANNEL_ID),
@@ -153,14 +146,12 @@ async def status_check(ctx):
     }
     channels_status = "\n".join([f"{'✅' if ch else '❌'} {name} channel" for name, ch in channels.items()])
 
-    # فحص MongoDB
     try:
         await mongo_client.admin.command("ping")
         mongo_status = "✅ Connected"
     except Exception as e:
         mongo_status = f"❌ Error: {e}"
 
-    # فحص المستخدمين المستهدفين (هل نقدر نجيب بياناتهم)
     target_statuses = []
     for uid in TARGET_USER_IDS:
         data = await fetch_user_data(uid)
@@ -169,7 +160,7 @@ async def status_check(ctx):
         else:
             target_statuses.append(f"❌ <@{uid}> inaccessible")
 
-    embed = discord.Embed(title="📊 System Status", color=0x7289DA, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="📊 System Status", color=0x7289DA, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Bot", value=bot_status, inline=False)
     embed.add_field(name="Selfbot", value=self_status, inline=False)
     embed.add_field(name="Channels", value=channels_status, inline=False)
@@ -225,7 +216,7 @@ async def _profile(ctx, user_id: str = None):
         asset = deco.get("asset")
         deco_str = f"[Preview](https://cdn.discordapp.com/avatar-decorations/{asset}.png)"
     creation_str = get_egypt_time(datetime.fromtimestamp(((int(user_id) >> 22) + 1420070400000) / 1000, tz=timezone.utc))
-    embed = discord.Embed(title=f"👤 Profile: @{username}", color=data.get("accent_color") or 0x7289DA, timestamp=datetime.utcnow())
+    embed = discord.Embed(title=f"👤 Profile: @{username}", color=data.get("accent_color") or 0x7289DA, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=avatar_url)
     if banner_url:
         embed.set_image(url=banner_url)
@@ -275,7 +266,7 @@ async def _activity(ctx, user_id: str = None):
     for act in acts:
         started = act.get("start_time")
         if started:
-            elapsed = datetime.utcnow() - started
+            elapsed = datetime.now(timezone.utc) - started
             dur = str(elapsed).split(".")[0]
         else:
             dur = "Unknown"
@@ -327,16 +318,10 @@ if selfbot:
         logging.info(f"👤 Selfbot logged in as {selfbot.user}")
         selfbot.loop.create_task(profile_check_loop())
         selfbot.loop.create_task(screenshot_worker())
-        # رسالة بدء في قناة التغييرات
         changes_channel = selfbot.get_channel(CHANGES_CHANNEL_ID)
         if changes_channel:
             embed = discord.Embed(title="🔄 Profile Monitoring Started", description="Checking profiles every minute.", color=0x00FF00)
             await changes_channel.send(embed=embed)
-
-    @selfbot.event
-    async def on_connect():
-        # لو الاتصال تم ولكن ما وصلش لـ on_ready (مثلاً خطأ في المصادقة)
-        pass
 
     @selfbot.event
     async def on_disconnect():
@@ -357,7 +342,7 @@ if selfbot:
         if str(after.id) not in TARGET_USER_IDS:
             return
         user_id = str(after.id)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         online_channel = selfbot.get_channel(ONLINE_CHANNEL_ID)
         activity_channel = selfbot.get_channel(ACTIVITY_CHANNEL_ID)
         if not online_channel or not activity_channel:
@@ -473,7 +458,7 @@ if selfbot:
                         title="🔄 Profile Update Detected",
                         description=f"<@{uid}> profile changed:\n" + "\n".join(changes),
                         color=0xFFA500,
-                        timestamp=datetime.utcnow()
+                        timestamp=datetime.now(timezone.utc)
                     )
                     embed.set_footer(text=f"Detected at {get_egypt_time()}")
                     if selfbot_ready:
@@ -506,9 +491,7 @@ if selfbot:
 # ==================== التشغيل الآمن ====================
 async def main():
     tasks = []
-    # بدء البوت الأساسي
     tasks.append(asyncio.create_task(bot.start(BOT_TOKEN)))
-    # بدء السيلف بوت إن أمكن
     if selfbot and USER_TOKEN:
         async def start_selfbot():
             global selfbot_error, selfbot_ready
@@ -526,7 +509,6 @@ async def main():
     else:
         logging.warning("Selfbot not started (missing USER_TOKEN or disabled).")
 
-    # الانتظار لكل المهام بدون ما نوقف لو في Exception
     await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
