@@ -73,7 +73,7 @@ selfbot_ready = False
 selfbot_error = None
 
 if USER_TOKEN:
-    selfbot = discord.Client()  # بدون Intents (discord.py-self لا يدعمها)
+    selfbot = discord.Client()  # بدون Intents
 else:
     selfbot = None
 
@@ -133,21 +133,24 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
 @bot.event
 async def on_ready():
     logger.info(f"🤖 Bot logged in as {bot.user}")
-    cmd_channel = bot.get_channel(COMMANDS_CHANNEL_ID)
-    if cmd_channel:
-        status_text = "✅ Connected & monitoring" if selfbot_ready else (
-            f"❌ Offline - {selfbot_error or 'Invalid token or not started'}"
-        )
-        embed = discord.Embed(
-            title="⚡ Discord Monitor System Online",
-            description=f"**Bot:** {bot.user.mention}\n"
-                        f"**Selfbot:** {status_text}\n\n"
-                        f"Use `!status` for full diagnostics.\n"
-                        f"All times in Egypt (GMT+3)",
-            color=0x00FF00,
-            timestamp=datetime.now(timezone.utc)
-        )
-        await cmd_channel.send(embeds=[embed])
+    try:
+        cmd_channel = await bot.fetch_channel(COMMANDS_CHANNEL_ID)
+        if cmd_channel:
+            status_text = "✅ Connected & monitoring" if selfbot_ready else (
+                f"❌ Offline - {selfbot_error or 'Invalid token or not started'}"
+            )
+            embed = discord.Embed(
+                title="⚡ Discord Monitor System Online",
+                description=f"**Bot:** {bot.user.mention}\n"
+                            f"**Selfbot:** {status_text}\n\n"
+                            f"Use `!status` for full diagnostics.\n"
+                            f"All times in Egypt (GMT+3)",
+                color=0x00FF00,
+                timestamp=datetime.now(timezone.utc)
+            )
+            await cmd_channel.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Failed to send online message: {e}")
 
 @bot.command(name="status")
 async def status_check(ctx):
@@ -191,7 +194,7 @@ async def status_check(ctx):
     embed.add_field(name="MongoDB", value=mongo_status, inline=False)
     embed.add_field(name="Target Users", value="\n".join(target_statuses), inline=False)
     embed.set_footer(text="Use !help for available commands")
-    await ctx.send(embeds=[embed])
+    await ctx.send(embed=embed)
 
 @bot.command(name="help", aliases=["commands"])
 async def custom_help(ctx):
@@ -206,7 +209,7 @@ async def custom_help(ctx):
     embed.add_field(name="!lastactivity [user_id]", value="Last completed activity details", inline=False)
     embed.add_field(name="!status", value="Show full system diagnostics", inline=False)
     embed.set_footer(text="All times in Egypt timezone (GMT+3)")
-    await ctx.send(embeds=[embed])
+    await ctx.send(embed=embed)
 
 @bot.command(name="profile")
 async def _profile(ctx, user_id: str = None):
@@ -252,7 +255,7 @@ async def _profile(ctx, user_id: str = None):
     embed.add_field(name="Avatar Decoration", value=deco_str, inline=False)
     embed.add_field(name="Bio", value=bio, inline=False)
     embed.set_footer(text=f"Requested at {get_egypt_time()}")
-    await ctx.send(embeds=[embed])
+    await ctx.send(embed=embed)
 
 @bot.command(name="about")
 async def _about(ctx, user_id: str = None):
@@ -296,7 +299,7 @@ async def _activity(ctx, user_id: str = None):
             dur = "Unknown"
         desc += f"🎮 **{act['name']}** — Since {get_egypt_time(started)} (elapsed: {dur})\n"
     embed = discord.Embed(title="🎯 Current Activity", description=desc, color=0x00FF00)
-    await ctx.send(embeds=[embed])
+    await ctx.send(embed=embed)
 
 @bot.command(name="lastseen")
 async def _lastseen(ctx, user_id: str = None):
@@ -315,7 +318,7 @@ async def _lastseen(ctx, user_id: str = None):
     if last_offline:
         msg += f"🔴 Last offline: {get_egypt_time(last_offline)}"
     embed = discord.Embed(title="⏱️ Last Seen", description=msg, color=0x7289DA)
-    await ctx.send(embeds=[embed])
+    await ctx.send(embed=embed)
 
 @bot.command(name="lastactivity")
 async def _lastactivity(ctx, user_id: str = None):
@@ -332,7 +335,7 @@ async def _lastactivity(ctx, user_id: str = None):
     duration = doc.get("duration", "Unknown")
     desc = f"🎮 **{name}**\nStarted: {get_egypt_time(start)}\nEnded: {get_egypt_time(end)}\nDuration: {duration}"
     embed = discord.Embed(title="📜 Last Activity", description=desc, color=0x7289DA)
-    await ctx.send(embeds=[embed])
+    await ctx.send(embed=embed)
 
 # ==================== السيلف بوت ====================
 if selfbot:
@@ -344,10 +347,12 @@ if selfbot:
         logger.info(f"👤 Selfbot logged in as {selfbot.user}")
         selfbot.loop.create_task(profile_check_loop())
         selfbot.loop.create_task(screenshot_worker())
-        changes_channel = selfbot.get_channel(CHANGES_CHANNEL_ID)
-        if changes_channel:
+        try:
+            changes_channel = await selfbot.fetch_channel(CHANGES_CHANNEL_ID)
             embed = discord.Embed(title="🔄 Profile Monitoring Started", description="Checking profiles every minute.", color=0x00FF00)
-            await changes_channel.send(embeds=[embed])
+            await changes_channel.send(embed=embed)
+        except Exception as e:
+            logger.error(f"Could not send start message: {e}")
 
     @selfbot.event
     async def on_connect():
@@ -373,9 +378,11 @@ if selfbot:
             return
         user_id = str(after.id)
         now = datetime.now(timezone.utc)
-        online_channel = selfbot.get_channel(ONLINE_CHANNEL_ID)
-        activity_channel = selfbot.get_channel(ACTIVITY_CHANNEL_ID)
-        if not online_channel or not activity_channel:
+        try:
+            online_channel = await selfbot.fetch_channel(ONLINE_CHANNEL_ID)
+            activity_channel = await selfbot.fetch_channel(ACTIVITY_CHANNEL_ID)
+        except Exception as e:
+            logger.error(f"Failed to fetch channels: {e}")
             return
 
         # تتبع الأونلاين/أوفلاين
@@ -383,7 +390,7 @@ if selfbot:
             if after.status == discord.Status.online:
                 embed = discord.Embed(title="🟢 Online", description=f"<@{user_id}> is now online.\n🕒 {get_egypt_time(now)}", color=0x57F287)
                 embed.set_thumbnail(url=after.display_avatar.url)
-                msg = await online_channel.send(embeds=[embed])
+                msg = await online_channel.send(embed=embed)
                 active_online_msgs[user_id] = msg
                 await online_msgs_col.update_one({"_id": user_id}, {"$set": {"msg_id": msg.id}}, upsert=True)
                 await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_online": now}}, upsert=True)
@@ -402,7 +409,7 @@ if selfbot:
                         color=0x747F8D
                     )
                     new_embed.set_thumbnail(url=after.display_avatar.url)
-                    await old_msg.edit(embeds=[new_embed])
+                    await old_msg.edit(embed=new_embed)
                     await online_msgs_col.delete_one({"_id": user_id})
                 await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": now}}, upsert=True)
 
@@ -417,7 +424,7 @@ if selfbot:
             start = act.start or now
             embed = discord.Embed(title="🎮 Activity Started", description=f"<@{user_id}> started **{act.name}**\n🕒 Since: {get_egypt_time(start)}", color=0x5865F2)
             embed.set_thumbnail(url=after.display_avatar.url)
-            msg = await activity_channel.send(embeds=[embed])
+            msg = await activity_channel.send(embed=embed)
             if user_id not in active_activity_msgs:
                 active_activity_msgs[user_id] = {}
             active_activity_msgs[user_id][name] = msg
@@ -444,7 +451,7 @@ if selfbot:
                         color=0xED4245
                     )
                     new_embed.set_thumbnail(url=after.display_avatar.url)
-                    await old_msg.edit(embeds=[new_embed])
+                    await old_msg.edit(embed=new_embed)
                     await activity_msgs_col.delete_one({"user_id": user_id, "activity_key": name})
                     await last_activity_col.update_one(
                         {"_id": user_id},
@@ -456,9 +463,10 @@ if selfbot:
 
     async def profile_check_loop():
         await selfbot.wait_until_ready()
-        changes_channel = selfbot.get_channel(CHANGES_CHANNEL_ID)
-        if not changes_channel:
-            logger.error("❌ Changes channel not found.")
+        try:
+            changes_channel = await selfbot.fetch_channel(CHANGES_CHANNEL_ID)
+        except Exception as e:
+            logger.error(f"❌ Could not fetch changes channel: {e}")
             return
         while not selfbot.is_closed():
             for uid in TARGET_USER_IDS:
@@ -495,9 +503,9 @@ if selfbot:
                         screenshot = await take_profile_screenshot(uid)
                         file = discord.File(screenshot, filename=f"profile_{uid}.png")
                         embed.set_image(url=f"attachment://profile_{uid}.png")
-                        await changes_channel.send(embeds=[embed], file=file)
+                        await changes_channel.send(embed=embed, file=file)
                     else:
-                        await changes_channel.send(embeds=[embed])
+                        await changes_channel.send(embed=embed)
             await asyncio.sleep(60)
 
     async def screenshot_worker():
@@ -512,7 +520,7 @@ if selfbot:
                     embed = discord.Embed(title="📸 Profile Screenshot", color=0x5865F2)
                     embed.set_image(url=f"attachment://ss_{user_id}.png")
                     embed.set_footer(text=f"Requested by {ctx.author} • {get_egypt_time()}")
-                    await ctx.send(embeds=[embed], file=file)
+                    await ctx.send(embed=embed, file=file)
             except Exception as e:
                 await ctx.send(f"❌ Failed to take screenshot: {e}")
             finally:
