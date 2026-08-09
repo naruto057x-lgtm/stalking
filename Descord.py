@@ -124,7 +124,7 @@ async def on_ready():
                         f"Use `!status` for full diagnostics.\n"
                         f"All times in Egypt (GMT+3)",
             color=0x00FF00,
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.utcnow()
         )
         await cmd_channel.send(embed=embed)
 
@@ -169,7 +169,7 @@ async def status_check(ctx):
         else:
             target_statuses.append(f"❌ <@{uid}> inaccessible")
 
-    embed = discord.Embed(title="📊 System Status", color=0x7289DA, timestamp=datetime.now(timezone.utc))
+    embed = discord.Embed(title="📊 System Status", color=0x7289DA, timestamp=datetime.utcnow())
     embed.add_field(name="Bot", value=bot_status, inline=False)
     embed.add_field(name="Selfbot", value=self_status, inline=False)
     embed.add_field(name="Channels", value=channels_status, inline=False)
@@ -225,7 +225,7 @@ async def _profile(ctx, user_id: str = None):
         asset = deco.get("asset")
         deco_str = f"[Preview](https://cdn.discordapp.com/avatar-decorations/{asset}.png)"
     creation_str = get_egypt_time(datetime.fromtimestamp(((int(user_id) >> 22) + 1420070400000) / 1000, tz=timezone.utc))
-    embed = discord.Embed(title=f"👤 Profile: @{username}", color=data.get("accent_color") or 0x7289DA, timestamp=datetime.now(timezone.utc))
+    embed = discord.Embed(title=f"👤 Profile: @{username}", color=data.get("accent_color") or 0x7289DA, timestamp=datetime.utcnow())
     embed.set_thumbnail(url=avatar_url)
     if banner_url:
         embed.set_image(url=banner_url)
@@ -275,7 +275,7 @@ async def _activity(ctx, user_id: str = None):
     for act in acts:
         started = act.get("start_time")
         if started:
-            elapsed = datetime.now(timezone.utc) - started
+            elapsed = datetime.utcnow() - started
             dur = str(elapsed).split(".")[0]
         else:
             dur = "Unknown"
@@ -357,7 +357,7 @@ if selfbot:
         if str(after.id) not in TARGET_USER_IDS:
             return
         user_id = str(after.id)
-        now = datetime.now(timezone.utc)
+        now = datetime.utcnow()
         online_channel = selfbot.get_channel(ONLINE_CHANNEL_ID)
         activity_channel = selfbot.get_channel(ACTIVITY_CHANNEL_ID)
         if not online_channel or not activity_channel:
@@ -473,7 +473,7 @@ if selfbot:
                         title="🔄 Profile Update Detected",
                         description=f"<@{uid}> profile changed:\n" + "\n".join(changes),
                         color=0xFFA500,
-                        timestamp=datetime.now(timezone.utc)
+                        timestamp=datetime.utcnow()
                     )
                     embed.set_footer(text=f"Detected at {get_egypt_time()}")
                     if selfbot_ready:
