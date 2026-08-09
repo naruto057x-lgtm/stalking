@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezoneA
 from zoneinfo import ZoneInfo
 
 import aiohttp
