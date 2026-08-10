@@ -330,20 +330,21 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
                 device_scale_factor=2,
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
-            await context.add_init_script(
-                "(token) => { try { window.localStorage.setItem('token', JSON.stringify(token)); } catch (err) { console.warn('localStorage unavailable', err); } }",
-                USER_TOKEN
-            )
+            token_script = f"window.localStorage.setItem('token', {json.dumps(USER_TOKEN)});"
+            await context.add_init_script(script=token_script)
             page = await context.new_page()
             await page.goto("https://discord.com/channels/@me", wait_until="networkidle", timeout=60000)
-            if "login" in page.url:
+            if "login" in page.url or "discord.com/login" in page.url:
+                log_step("SCREENSHOT", "Login page detected after initial auth injection", user_id=user_id, page_url=page.url)
+                await asyncio.sleep(3)
                 await page.reload(wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(2)
             await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
             try:
-                await page.locator("div[class*='profile']").first.wait_for(timeout=15000)
+                await page.locator("div[class*='profile']").first.wait_for(timeout=20000)
             except Exception:
                 logger.warning(f"Profile screenshot selector timeout for user {user_id}, page_url={page.url}")
+            if "login" in page.url or "discord.com/login" in page.url:
+                raise RuntimeError(f"Authentication failed - still on login page for user {user_id}")
             screenshot = await page.screenshot(full_page=True)
             await browser.close()
             log_step("SCREENSHOT", "Playwright profile capture completed", user_id=user_id, size=len(screenshot), page_url=page.url)
