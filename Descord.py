@@ -296,13 +296,20 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     log_step("MESSAGE", "Received message event", author_id=message.author.id if message.author else None, channel_id=message.channel.id if message.channel else None, content=message.content)
-    if message.author.id != bot.user.id:
-        log_step("MESSAGE", "Ignored message because author is not the selfbot", author_id=message.author.id if message.author else None)
+
+    if message.author.bot:
+        log_step("MESSAGE", "Ignored message because the author is a bot or system account", author_id=message.author.id if message.author else None)
         return
+
     if message.channel.id != COMMANDS_CHANNEL_ID:
         log_step("MESSAGE", "Ignored message because channel is not the commands channel", channel_id=message.channel.id if message.channel else None, expected_channel_id=COMMANDS_CHANNEL_ID)
         return
-    log_step("MESSAGE", "Forwarding message to command processor", content=message.content)
+
+    if not message.content.startswith("!"):
+        log_step("MESSAGE", "Ignored message because it does not start with the command prefix", content=message.content)
+        return
+
+    log_step("MESSAGE", "Forwarding command message to command processor", content=message.content, author_id=message.author.id if message.author else None)
     await bot.process_commands(message)
 
 # ==================== الأوامر ====================
