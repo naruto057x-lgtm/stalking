@@ -141,14 +141,8 @@ async def send_message_with_file(channel_id: int, embed: discord.Embed, file_byt
                 logger.error(f"❌ Failed to send file: {resp.status} {text}")
 
 # ==================== إعداد البوت و MongoDB ====================
-intents = discord.Intents.default()
-intents.message_content = True
-intents.presences = True
-intents.guilds = True
-intents.members = True
-
-# تم تفعيل التخفي ليكون Selfbot سري
-bot = commands.Bot(command_prefix="!", self_bot=True, intents=intents)
+# selfbot لا يحتاج intents، ونستخدم discord-py-self مباشرةً
+bot = commands.Bot(command_prefix="!", self_bot=True)
 bot.remove_command("help")
 
 try:
