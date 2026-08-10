@@ -141,8 +141,14 @@ async def send_message_with_file(channel_id: int, embed: discord.Embed, file_byt
                 logger.error(f"❌ Failed to send file: {resp.status} {text}")
 
 # ==================== إعداد البوت و MongoDB ====================
+intents = discord.Intents.default()
+intents.message_content = True
+intents.presences = True
+intents.guilds = True
+intents.members = True
+
 # تم تفعيل التخفي ليكون Selfbot سري
-bot = commands.Bot(command_prefix="!", self_bot=True)
+bot = commands.Bot(command_prefix="!", self_bot=True, intents=intents)
 bot.remove_command("help")
 
 try:
@@ -161,6 +167,8 @@ except Exception as e:
 active_online_msgs = {}
 active_activity_msgs = {}
 current_activities = {}
+current_status = {}
+pending_offline_tasks = {}
 screenshot_queue = asyncio.Queue()
 
 # ==================== دوال جلب البيانات ====================
@@ -178,22 +186,55 @@ async def fetch_user_data(user_id: str) -> dict | None:
 async def take_profile_screenshot(user_id: str) -> io.BytesIO:
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 device_scale_factor=2,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" # 👈 إضافة User Agent حقيقي
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = await context.new_page()
-            await page.set_extra_http_headers({"Authorization": USER_TOKEN})
+            await page.goto("https://discord.com/login", wait_until="networkidle")
+            await page.evaluate("(token) => window.localStorage.setItem('token', JSON.stringify(token))", USER_TOKEN)
+            await page.goto("https://discord.com/channels/@me", wait_until="networkidle")
             await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle")
-            await page.wait_for_selector("div[class*='profile']", timeout=15000)
+            try:
+                await page.wait_for_selector("div[class*='profile']", timeout=15000)
+            except Exception:
+                logger.warning(f"Profile screenshot selector timeout for user {user_id}")
             screenshot = await page.screenshot(full_page=True)
             await browser.close()
             return io.BytesIO(screenshot)
     except Exception as e:
         logger.error(f"Screenshot failed: {e}")
         return io.BytesIO(b'')
+
+async def schedule_offline_confirmation(user_id: str, started: datetime):
+    await asyncio.sleep(600)
+    if current_status.get(user_id) != discord.Status.offline:
+        return
+    online_data = active_online_msgs.get(user_id)
+    if not online_data:
+        return
+
+    end_time = datetime.now(timezone.utc)
+    duration = str(end_time - started).split(".")[0]
+    embed = discord.Embed(
+        title="🔴 Session Confirmed Ended",
+        description=f"<@{user_id}> remained offline for 10 minutes and the session has ended."
+    )
+    embed.add_field(name="Session Started", value=get_egypt_time(started), inline=False)
+    embed.add_field(name="Session Ended", value=get_egypt_time(end_time), inline=False)
+    embed.add_field(name="Total Duration", value=f"⏱️ **{duration}**", inline=False)
+    if online_data.get("avatar_url"):
+        embed.set_thumbnail(url=online_data["avatar_url"])
+    if online_data.get("username"):
+        embed.set_footer(text=f"{online_data['username']} • Last checked {get_egypt_time()}")
+
+    await edit_message(ONLINE_CHANNEL_ID, online_data["msg_id"], embed)
+    active_online_msgs.pop(user_id, None)
+    pending_offline_tasks.pop(user_id, None)
+    await online_msgs_col.delete_one({"_id": user_id})
+    await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": end_time}}, upsert=True)
 
 # ==================== أحداث البوت الأساسية ====================
 @bot.event
@@ -209,6 +250,12 @@ async def on_ready():
 
     bot.loop.create_task(profile_check_loop())
     bot.loop.create_task(screenshot_worker())
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.id != bot.user.id:
+        return
+    await bot.process_commands(message)
 
 # ==================== الأوامر ====================
 @bot.command(name="status")
@@ -236,7 +283,7 @@ async def status_check(ctx):
     embed.set_footer(text=f"Requested at {get_egypt_time()}")
     await send_message(ctx.channel.id, embed)
 
-@bot.command(name="help", aliases=["commands"])
+@bot.command(name="help", aliases=["commands", "cmd"])
 async def custom_help(ctx):
     if ctx.channel.id != COMMANDS_CHANNEL_ID: return
     
@@ -359,50 +406,55 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     user_id = str(after.id)
     if user_id not in TARGET_USER_IDS: return
     now = datetime.now(timezone.utc)
+    current_status[user_id] = after.status
 
     # 1. تتبع الأونلاين/أوفلاين
     if before.status != after.status:
         if after.status == discord.Status.online:
-            embed = discord.Embed(
-                title="🟢 User is Online",
-                description=f"<@{user_id}> has connected to Discord.\n\n🕒 **Time:** {get_egypt_time(now)}"
-            )
-            msg_id = await send_message(ONLINE_CHANNEL_ID, embed)
-            if msg_id:
-                active_online_msgs[user_id] = msg_id
-                await online_msgs_col.update_one(
-                    {"_id": user_id},
-                    {"$set": {"msg_id": msg_id, "start_time": now}},
-                    upsert=True
+            if user_id in pending_offline_tasks:
+                pending_offline_tasks[user_id].cancel()
+                pending_offline_tasks.pop(user_id, None)
+
+            if user_id not in active_online_msgs:
+                avatar_url = None
+                try:
+                    avatar_url = str(after.display_avatar.url)
+                except Exception:
+                    avatar_url = None
+
+                embed = discord.Embed(
+                    title="🟢 User is Online",
+                    description=f"<@{user_id}> has connected to Discord.\n\n🕒 **Started at:** {get_egypt_time(now)}"
                 )
+                if avatar_url:
+                    embed.set_thumbnail(url=avatar_url)
+                embed.set_footer(text=f"Tracking online session for <@{user_id}>")
+
+                msg_id = await send_message(ONLINE_CHANNEL_ID, embed)
+                if msg_id:
+                    active_online_msgs[user_id] = {
+                        "msg_id": msg_id,
+                        "start_time": now,
+                        "avatar_url": avatar_url,
+                        "username": after.display_name
+                    }
+                    await online_msgs_col.update_one(
+                        {"_id": user_id},
+                        {"$set": {"msg_id": msg_id, "start_time": now}},
+                        upsert=True
+                    )
             await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_online": now}}, upsert=True)
 
         elif after.status == discord.Status.offline:
-            doc = await online_msgs_col.find_one({"_id": user_id})
-            dur_str = "unknown"
-            start_time = None
-            if doc and doc.get("start_time"):
-                start_time = doc["start_time"]
-                dur_str = str(now - start_time).split(".")[0]
+            online_data = active_online_msgs.get(user_id)
+            if online_data:
+                if user_id in pending_offline_tasks:
+                    pending_offline_tasks[user_id].cancel()
 
-            embed = discord.Embed(
-                title="🔴 User went Offline", 
-                description=f"<@{user_id}> has disconnected."
-            )
-            if start_time: embed.add_field(name="Session Start", value=get_egypt_time(start_time), inline=False)
-            embed.add_field(name="Disconnected At", value=get_egypt_time(now), inline=False)
-            embed.add_field(name="Total Session Time", value=f"⏱️ **{dur_str}**", inline=False)
-
-            if user_id in active_online_msgs:
-                msg_id = active_online_msgs.pop(user_id)
-                await edit_message(ONLINE_CHANNEL_ID, msg_id, embed)
-                await online_msgs_col.delete_one({"_id": user_id})
+                task = asyncio.create_task(schedule_offline_confirmation(user_id, online_data["start_time"]))
+                pending_offline_tasks[user_id] = task
             else:
-                await send_message(ONLINE_CHANNEL_ID, embed)
-                
-            await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": now}}, upsert=True)
-
-    # 2. تتبع الأنشطة
+                await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": now}}, upsert=True)
     before_acts = {act.name: act for act in before.activities if act.type != discord.ActivityType.custom}
     after_acts = {act.name: act for act in after.activities if act.type != discord.ActivityType.custom}
     
@@ -530,6 +582,6 @@ async def screenshot_worker():
 if __name__ == "__main__":
     try:
         # لو بتستخدم مكتبة discord.py-self، التوكن بتاعك هيشتغل كأنه فاتح من التطبيق
-        bot.run(USER_TOKEN)
+        bot.run(USER_TOKEN, bot=False)
     except Exception as e:
         logger.critical(f"Fatal error: {e}\n{traceback.format_exc()}")
