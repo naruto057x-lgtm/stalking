@@ -575,7 +575,7 @@ async def screenshot_worker():
 # ==================== التشغيل ====================
 if __name__ == "__main__":
     try:
-        # لو بتستخدم مكتبة discord.py-self، التوكن بتاعك هيشتغل كأنه فاتح من التطبيق
-        bot.run(USER_TOKEN, bot=False)
+        # لو بتستخدم مكتبة discord.py-self، شغّل مباشرةً بالتوكن فقط
+        bot.run(USER_TOKEN)
     except Exception as e:
         logger.critical(f"Fatal error: {e}\n{traceback.format_exc()}")
