@@ -83,6 +83,33 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+DEBUG_DUMP_DIR = os.getenv("DEBUG_DUMP_DIR", "debug_dumps")
+os.makedirs(DEBUG_DUMP_DIR, exist_ok=True)
+
+async def capture_page_debug_state(page, label: str, user_id: str):
+    try:
+        url = page.url
+        title = await page.title()
+        cookies = await page.context.cookies()
+        local_storage = await page.evaluate("() => JSON.stringify(Object.fromEntries(Object.entries(window.localStorage)))")
+        content_snippet = await page.content()
+        debug_text = (
+            f"--- DEBUG STATE [{label}] ---\n"
+            f"user_id={user_id}\n"
+            f"url={url}\n"
+            f"title={title}\n"
+            f"cookies={json.dumps(cookies, default=str)}\n"
+            f"localStorage={local_storage}\n"
+            f"content_snippet={content_snippet[:2500]}\n"
+        )
+        filename = os.path.join(DEBUG_DUMP_DIR, f"debug_{label}_{user_id}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.txt")
+        with open(filename, "w", encoding="utf-8") as dump_file:
+            dump_file.write(debug_text)
+        logger.info(f"DEBUG_DUMP_SAVED | {filename}")
+    except Exception as exc:
+        log_exception("capture_page_debug_state", exc, user_id=user_id, label=label)
+
+
 def embed_to_text(embed: discord.Embed) -> str:
     """تحويل بيانات الـ Embed إلى تصميم نصي (Markdown) احترافي مدعوم للـ Selfbot"""
     lines = []
@@ -324,27 +351,58 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
     try:
         log_step("SCREENSHOT", "Starting Playwright profile capture", user_id=user_id)
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 device_scale_factor=2,
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
-            token_script = f"window.localStorage.setItem('token', {json.dumps(USER_TOKEN)});"
+            token_script = f"(() => {{ window.localStorage.setItem('token', {json.dumps(USER_TOKEN)}); }})();"
             await context.add_init_script(script=token_script)
+
             page = await context.new_page()
-            await page.goto("https://discord.com/channels/@me", wait_until="networkidle", timeout=60000)
+            await page.add_init_script(script=token_script)
+            await page.goto("https://discord.com/login?redirect_to=%2Fchannels%2F%40me", wait_until="networkidle", timeout=60000)
+            await capture_page_debug_state(page, "initial_navigate", user_id)
+
             if "login" in page.url or "discord.com/login" in page.url:
                 log_step("SCREENSHOT", "Login page detected after initial auth injection", user_id=user_id, page_url=page.url)
-                await asyncio.sleep(3)
+                try:
+                    await page.evaluate(token_script)
+                    await asyncio.sleep(2)
+                    await page.goto("https://discord.com/channels/@me", wait_until="networkidle", timeout=60000)
+                    await capture_page_debug_state(page, "after_first_token_eval", user_id)
+                except Exception as eval_exc:
+                    log_exception("SCREENSHOT_EVAL", eval_exc, user_id=user_id)
+
+            if "login" in page.url or "discord.com/login" in page.url:
+                log_step("SCREENSHOT", "Retrying login injection on login page", user_id=user_id, page_url=page.url)
+                try:
+                    await page.evaluate(token_script)
+                except Exception as eval_exc:
+                    log_exception("SCREENSHOT_EVAL_RETRY", eval_exc, user_id=user_id)
+                await asyncio.sleep(2)
                 await page.reload(wait_until="networkidle", timeout=60000)
-            await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
+                await capture_page_debug_state(page, "after_reload", user_id)
+
+            if "login" in page.url or "discord.com/login" in page.url:
+                log_step("SCREENSHOT", "Navigating directly to user profile after auth retries", user_id=user_id, target_url=f"https://discord.com/users/{user_id}")
+                await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
+                await capture_page_debug_state(page, "after_profile_navigate", user_id)
+
             try:
                 await page.locator("div[class*='profile']").first.wait_for(timeout=20000)
-            except Exception:
+            except Exception as selector_exc:
                 logger.warning(f"Profile screenshot selector timeout for user {user_id}, page_url={page.url}")
+                log_exception("SCREENSHOT_SELECTOR_TIMEOUT", selector_exc, user_id=user_id, page_url=page.url)
+                await capture_page_debug_state(page, "selector_timeout", user_id)
+
             if "login" in page.url or "discord.com/login" in page.url:
+                page_dump = await page.content()
+                logger.error(f"SCREENSHOT_AUTH_FAILED: login page still visible for user {user_id}, url={page.url}, content_snippet={page_dump[:1000]}")
+                await capture_page_debug_state(page, "final_login_failure", user_id)
                 raise RuntimeError(f"Authentication failed - still on login page for user {user_id}")
+
             screenshot = await page.screenshot(full_page=True)
             await browser.close()
             log_step("SCREENSHOT", "Playwright profile capture completed", user_id=user_id, size=len(screenshot), page_url=page.url)
@@ -882,7 +940,8 @@ async def screenshot_worker():
     log_step("SCREENSHOT_WORKER", "Screenshot worker started")
     while True:
         ctx, user_id = await screenshot_queue.get()
-        log_step("SCREENSHOT_WORKER", "Processing screenshot request", user_id=user_id, channel_id=ctx.channel.id if ctx.channel else None)
+        queue_size = screenshot_queue.qsize()
+        log_step("SCREENSHOT_WORKER", "Processing screenshot request", user_id=user_id, channel_id=ctx.channel.id if ctx.channel else None, queue_size=queue_size)
         try:
             screenshot = await take_profile_screenshot(user_id)
             if screenshot.getbuffer().nbytes == 0:
