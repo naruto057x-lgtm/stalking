@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 import traceback
-import random # 👈 تم الإضافة لإعطاء طابع بشري للسكربت
+import random
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -78,9 +78,18 @@ def get_egypt_time(dt: datetime = None) -> str:
 
 # ==================== دوال HTTP مع التصميم الاحترافي ====================
 BASE_API = "https://discord.com/api/v10"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 HEADERS = {
     "Authorization": USER_TOKEN,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json"
+}
+UPLOAD_HEADERS = {
+    "Authorization": USER_TOKEN,
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
 DEBUG_DUMP_DIR = os.getenv("DEBUG_DUMP_DIR", "debug_dumps")
@@ -197,11 +206,12 @@ async def send_message(channel_id: int, embed: discord.Embed) -> int:
         
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=HEADERS, json=payload) as resp:
-                if resp.status == 200:
+                if resp.status in (200, 201):
                     data = await resp.json()
-                    logger.info(f"✅ Sent message to channel {channel_id}")
-                    log_step("HTTP_SEND", "Embed message sent successfully", channel_id=channel_id, message_id=data.get("id"))
-                    return int(data["id"])
+                    message_id = int(data.get("id", 0) or 0)
+                    logger.info(f"✅ Sent message to channel {channel_id} | message_id={message_id}")
+                    log_step("HTTP_SEND", "Embed message sent successfully", channel_id=channel_id, message_id=message_id)
+                    return message_id
                 else:
                     text = await resp.text()
                     logger.error(f"❌ Failed to send message: {resp.status} {text}")
@@ -246,19 +256,27 @@ async def send_message_with_file(channel_id: int, embed: discord.Embed, file_byt
         log_step("HTTP_FILE", "Uploading file payload", channel_id=channel_id, filename=filename)
         
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers={"Authorization": USER_TOKEN}, data=form) as resp:
+            async with session.post(url, headers=UPLOAD_HEADERS, data=form) as resp:
                 response_text = await resp.text()
-                if resp.status == 200:
-                    logger.info(f"📸 Sent message with screenshot file | channel={channel_id} | filename={filename} | bytes={file_bytes.getbuffer().nbytes}")
-                    log_step("HTTP_FILE", "File message sent successfully", channel_id=channel_id, filename=filename, bytes=file_bytes.getbuffer().nbytes)
+                if resp.status in (200, 201):
+                    try:
+                        data = json.loads(response_text)
+                        message_id = int(data.get("id", 0) or 0)
+                    except Exception:
+                        message_id = 0
+                    logger.info(f"📸 Sent message with screenshot file | channel={channel_id} | filename={filename} | bytes={file_bytes.getbuffer().nbytes} | message_id={message_id}")
+                    log_step("HTTP_FILE", "File message sent successfully", channel_id=channel_id, filename=filename, bytes=file_bytes.getbuffer().nbytes, message_id=message_id)
+                    return message_id
                 else:
                     logger.error(f"❌ File upload failed | status={resp.status} | channel={channel_id} | filename={filename}")
                     log_step("HTTP_FILE", "File message send failed", channel_id=channel_id, filename=filename, status=resp.status, response=response_text[:1000])
                     logger.error(f"HTTP_FILE_RESPONSE | {response_text[:1000]}")
+                    return 0
     except Exception as exc:
         log_exception("send_message_with_file", exc, channel_id=channel_id, filename=filename)
+        return 0
 
-async def send_text_message(channel_id: int, text: str):
+async def send_text_message(channel_id: int, text: str) -> int:
     """إرسال رسالة نصية بسيطة عبر HTTP"""
     log_step("HTTP_TEXT", "Preparing to send text message", channel_id=channel_id, text_length=len(text))
     try:
@@ -267,15 +285,23 @@ async def send_text_message(channel_id: int, text: str):
         payload = {"content": text}
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=HEADERS, json=payload) as resp:
-                if resp.status == 200:
-                    logger.info(f"💬 Sent text message to channel {channel_id}")
-                    log_step("HTTP_TEXT", "Text message sent successfully", channel_id=channel_id)
+                raw = await resp.text()
+                if resp.status in (200, 201):
+                    try:
+                        data = json.loads(raw)
+                        message_id = int(data.get("id", 0) or 0)
+                    except Exception:
+                        message_id = 0
+                    logger.info(f"💬 Sent text message to channel {channel_id} | message_id={message_id}")
+                    log_step("HTTP_TEXT", "Text message sent successfully", channel_id=channel_id, message_id=message_id)
+                    return message_id
                 else:
-                    raw = await resp.text()
                     logger.error(f"❌ Failed to send text message: {resp.status} {raw}")
                     log_step("HTTP_TEXT", "Text message send failed", channel_id=channel_id, status=resp.status, response=raw)
+                    return 0
     except Exception as exc:
         log_exception("send_text_message", exc, channel_id=channel_id)
+        return 0
 
 class SimpleCommandContext:
     def __init__(self, message: discord.Message):
@@ -437,6 +463,10 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
             )
             await context.add_init_script(script=stealth_script)
 
+            auth_token_json = json.dumps(f'"{USER_TOKEN}"')
+            await context.add_init_script(f"window.localStorage.setItem('token', {auth_token_json});")
+            log_step("SCREENSHOT", "Injected Discord auth token init script", user_id=user_id)
+
             page = await context.new_page()
             log_step("SCREENSHOT", "Page created", user_id=user_id)
 
@@ -446,8 +476,11 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
 
             if "discord.com/login" in page.url or page.url.endswith("/login"):
                 logger.info(f"SCREENSHOT | Login page detected after initial navigation, retrying profile navigation | user={user_id} | url={page.url}")
+                await page.evaluate(f"window.localStorage.setItem('token', {auth_token_json});")
+                await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
+            else:
+                await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
 
-            await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
             await page.wait_for_load_state("domcontentloaded", timeout=60000)
             await capture_page_summary(page, "profile_page_navigate", user_id)
 
@@ -505,7 +538,11 @@ async def schedule_offline_confirmation(user_id: str, started: datetime):
     if online_data.get("username"):
         embed.set_footer(text=f"{online_data['username']} • Last checked {get_egypt_time()}")
 
-    await edit_message(ONLINE_CHANNEL_ID, online_data["msg_id"], embed)
+    if online_data.get("msg_id"):
+        await edit_message(ONLINE_CHANNEL_ID, online_data["msg_id"], embed)
+    else:
+        await send_message(ONLINE_CHANNEL_ID, embed)
+
     active_online_msgs.pop(user_id, None)
     pending_offline_tasks.pop(user_id, None)
     await online_msgs_col.delete_one({"_id": user_id})
@@ -633,14 +670,15 @@ async def custom_help(ctx):
     if ctx.channel.id != COMMANDS_CHANNEL_ID: return
     
     embed = discord.Embed(title="📖 Available Monitoring Commands")
-    embed.add_field(name="`!profile [user_id]`", value="Show full formatted profile details.", inline=False)
-    embed.add_field(name="`!about [user_id]`", value="Extract and show just the About Me section.", inline=False)
-    embed.add_field(name="`!ss [user_id]`", value="Capture a live screenshot of the user's profile.", inline=False)
-    embed.add_field(name="`!activity [user_id]`", value="Check what the user is currently doing.", inline=False)
-    embed.add_field(name="`!lastseen [user_id]`", value="Check the exact time they last came online or went offline.", inline=False)
-    embed.add_field(name="`!lastactivity [user_id]`", value="Check the details of the last app/game they played.", inline=False)
-    embed.add_field(name="`!status`", value="Run system diagnostics.", inline=False)
-    embed.set_footer(text="🕒 All times displayed in Egypt Time (GMT+3)")
+    embed.description = "اكتب أي أمر في القناة المخصصة للأوامر فقط. هذا البوت يتابع الأونلاين/أوفلاين والنشاطات والتغيرات في البروفايل."
+    embed.add_field(name="`!profile [user_id]`", value="عرض تفاصيل كاملة عن البروفايل المراقب، مع معلومات الحساب الحالية.", inline=False)
+    embed.add_field(name="`!about [user_id]`", value="عرض نص الـ About Me فقط لحساب المستخدم المطلوب.", inline=False)
+    embed.add_field(name="`!ss [user_id]`", value="التقاط سكرين شوت حيّ لصفحة بروفايل المستخدم وإرسالها كصورة.", inline=False)
+    embed.add_field(name="`!activity [user_id]`", value="عرض النشاطات الحالية للمستخدم ومدة كل نشاط.", inline=False)
+    embed.add_field(name="`!lastseen [user_id]`", value="عرض آخر مرة كان المستخدم أونلاين فيها.", inline=False)
+    embed.add_field(name="`!lastactivity [user_id]`", value="عرض آخر نشاط للمستخدم ومدة النشاط وزمن البداية والنهاية.", inline=False)
+    embed.add_field(name="`!status`", value="عرض حالة البوت والرومات المتاحة.", inline=False)
+    embed.set_footer(text="🕒 جميع الأوقات بتوقيت مصر GMT+3")
     await send_message(ctx.channel.id, embed)
 
 @bot.command(name="profile")
@@ -798,9 +836,9 @@ async def _lastseen(ctx, user_id: str = None):
 
         lines = []
         if doc.get("last_online"):
-            lines.append(f"🟢 Last Online: {get_egypt_time(doc.get('last_online'))}")
+            lines.append(f"🟢 Last Online: {get_egypt_time(doc.get("last_online"))}")
         if doc.get("last_offline"):
-            lines.append(f"🔴 Last Offline: {get_egypt_time(doc.get('last_offline'))}")
+            lines.append(f"🔴 Last Offline: {get_egypt_time(doc.get("last_offline"))}")
         embed.add_field(name=f"<@{uid}>", value="\n".join(lines) or "No last-seen history found.", inline=False)
 
     await send_message(ctx.channel.id, embed)
@@ -816,6 +854,7 @@ async def _lastactivity(ctx, user_id: str = None):
 
     embed = discord.Embed(title="📜 Last Activity History for Monitored Targets")
     embed.set_footer(text=f"Fetched at {get_egypt_time()}")
+    any_success = False
 
     for uid in user_ids:
         doc = await last_activity_col.find_one({"_id": uid})
@@ -842,15 +881,21 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     # 1. تتبع الأونلاين/أوفلاين
     if before.status != after.status:
         if after.status == discord.Status.online:
+            # cancel any pending offline confirmation
             if user_id in pending_offline_tasks:
-                pending_offline_tasks[user_id].cancel()
+                try:
+                    pending_offline_tasks[user_id].cancel()
+                except Exception as e:
+                    log_exception("CANCEL_PENDING_OFFLINE", e, user_id=user_id)
                 pending_offline_tasks.pop(user_id, None)
 
+            # only announce new online sessions once
             if user_id not in active_online_msgs:
                 avatar_url = None
                 try:
                     avatar_url = str(after.display_avatar.url)
-                except Exception:
+                except Exception as e:
+                    log_exception("AVATAR_URL_RESOLVE", e, user_id=user_id)
                     avatar_url = None
 
                 embed = discord.Embed(
@@ -861,20 +906,45 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
                     embed.set_thumbnail(url=avatar_url)
                 embed.set_footer(text=f"Tracking online session for <@{user_id}>")
 
-                msg_id = await send_message(ONLINE_CHANNEL_ID, embed)
-                if msg_id:
-                    active_online_msgs[user_id] = {
-                        "msg_id": msg_id,
-                        "start_time": now,
-                        "avatar_url": avatar_url,
-                        "username": after.display_name
-                    }
+                # Primary send attempt
+                try:
+                    msg_id = await send_message(ONLINE_CHANNEL_ID, embed)
+                    log_step("SEND_ONLINE", "Primary send_message returned", user_id=user_id, channel=ONLINE_CHANNEL_ID, msg_id=msg_id)
+                except Exception as e:
+                    msg_id = 0
+                    log_exception("SEND_ONLINE_EXCEPTION", e, user_id=user_id, channel=ONLINE_CHANNEL_ID)
+
+                # Fallback if primary send failed (msg_id is falsy)
+                if not msg_id:
+                    try:
+                        text = f"🟢 <@{user_id}> is online • {get_egypt_time(now)}"
+                        text_msg_id = await send_text_message(ONLINE_CHANNEL_ID, text)
+                        msg_id = text_msg_id or msg_id
+                        logger.warning(f"ONLINE_FALLBACK_TEXT_SENT | user={user_id} | channel={ONLINE_CHANNEL_ID} | message_id={text_msg_id}")
+                    except Exception as e:
+                        log_exception("SEND_ONLINE_FALLBACK", e, user_id=user_id, channel=ONLINE_CHANNEL_ID)
+
+                # record session locally even if msg_id is falsy so we can later confirm
+                active_online_msgs[user_id] = {
+                    "msg_id": msg_id or None,
+                    "start_time": now,
+                    "avatar_url": avatar_url,
+                    "username": after.display_name
+                }
+                try:
                     await online_msgs_col.update_one(
                         {"_id": user_id},
-                        {"$set": {"msg_id": msg_id, "start_time": now}},
+                        {"$set": {"msg_id": msg_id or None, "start_time": now}},
                         upsert=True
                     )
-            await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_online": now}}, upsert=True)
+                except Exception as e:
+                    log_exception("DB_UPDATE_ONLINE_MSG", e, user_id=user_id, msg_id=msg_id)
+
+            # always update last seen time
+            try:
+                await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_online": now}}, upsert=True)
+            except Exception as e:
+                log_exception("DB_UPDATE_LAST_ONLINE", e, user_id=user_id, last_online=now)
 
         elif after.status == discord.Status.offline:
             online_data = active_online_msgs.get(user_id)
@@ -970,7 +1040,7 @@ async def profile_check_loop():
                     "clan_tag": data.get("clan", {}).get("tag") if data.get("clan") else None,
                     "avatar_decoration": data.get("avatar_decoration_data", {}).get("asset") if data.get("avatar_decoration_data") else None
                 }
-                
+
                 changes = []
                 if cached:
                     for key in new_cache:
