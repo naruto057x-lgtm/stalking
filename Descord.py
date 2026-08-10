@@ -35,6 +35,7 @@ ACTIVITY_CHANNEL_ID = 1535834292502929468
 ONLINE_CHANNEL_ID   = 1535834924958089286
 CHANGES_CHANNEL_ID  = 1509353152724340846
 COMMANDS_CHANNEL_ID = 1509464730509643846
+SERVER_ID = 1516638407919669290
 
 # رابط قاعدة البيانات
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://...")
@@ -288,6 +289,37 @@ async def fetch_user_data(user_id: str) -> dict | None:
                 log_exception("fetch_user_data", exc, user_id=user_id, endpoint=endpoint)
     return None
 
+
+def normalize_user_id(user_id: str | None) -> str | None:
+    if not user_id:
+        return None
+    candidate = user_id.strip()
+    lowered = candidate.lower()
+    if lowered in {"all", "both"}:
+        return "all"
+    if candidate.startswith("<@") and candidate.endswith(">"):
+        candidate = candidate.replace("<@", "").replace("!", "").replace(">", "")
+    return candidate
+
+
+def get_command_user_ids(user_id: str | None) -> list[str]:
+    normalized = normalize_user_id(user_id)
+    if not normalized or normalized == "all":
+        return TARGET_USER_IDS[:]
+    if normalized in TARGET_USER_IDS:
+        return [normalized]
+    return [normalized]
+
+
+def get_server_member(user_id: str) -> discord.Member | None:
+    guild = bot.get_guild(SERVER_ID)
+    if not guild:
+        return None
+    try:
+        return guild.get_member(int(user_id))
+    except Exception:
+        return None
+
 async def take_profile_screenshot(user_id: str) -> io.BytesIO:
     try:
         log_step("SCREENSHOT", "Starting Playwright profile capture", user_id=user_id)
@@ -298,19 +330,23 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
                 device_scale_factor=2,
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
+            await context.add_init_script(
+                "(token) => { try { window.localStorage.setItem('token', JSON.stringify(token)); } catch (err) { console.warn('localStorage unavailable', err); } }",
+                USER_TOKEN
+            )
             page = await context.new_page()
-
-            await page.goto(f"https://discord.com/users/{user_id}", wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=20000)
-
+            await page.goto("https://discord.com/channels/@me", wait_until="networkidle", timeout=60000)
+            if "login" in page.url:
+                await page.reload(wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(2)
+            await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
             try:
-                await page.locator("div[class*='profile']", has_text="").first.wait_for(timeout=15000)
+                await page.locator("div[class*='profile']").first.wait_for(timeout=15000)
             except Exception:
-                logger.warning(f"Profile screenshot selector timeout for user {user_id}")
-
+                logger.warning(f"Profile screenshot selector timeout for user {user_id}, page_url={page.url}")
             screenshot = await page.screenshot(full_page=True)
             await browser.close()
-            log_step("SCREENSHOT", "Playwright profile capture completed", user_id=user_id, size=len(screenshot))
+            log_step("SCREENSHOT", "Playwright profile capture completed", user_id=user_id, size=len(screenshot), page_url=page.url)
             return io.BytesIO(screenshot)
     except Exception as e:
         log_exception("take_profile_screenshot", e, user_id=user_id)
@@ -478,104 +514,190 @@ async def custom_help(ctx):
 
 @bot.command(name="profile")
 async def _profile(ctx, user_id: str = None):
-    if ctx.channel.id != COMMANDS_CHANNEL_ID: return
-    user_id = user_id or TARGET_USER_IDS[0]
-    
-    if user_id not in TARGET_USER_IDS:
-        return await ctx.send("❌ This user is not in the target list.")
-        
-    data = await fetch_user_data(user_id)
-    if not data:
-        return await ctx.send("❌ Could not fetch profile data from Discord API.")
+    if ctx.channel.id != COMMANDS_CHANNEL_ID:
+        return
 
-    username = data.get("username", "Unknown")
-    global_name = data.get("global_name") or "None"
-    bio = data.get("bio") or "*No bio written*"
-    
-    clan = data.get("clan")
-    clan_str = "*Not in a Clan*"
-    if clan: clan_str = f"**₊ {clan.get('tag', 'No tag')}**"
-    
-    deco = data.get("avatar_decoration_data")
-    deco_str = "*None*"
-    if deco: deco_str = f"[Preview Link](https://cdn.discordapp.com/avatar-decorations/{deco.get('asset')}.png)"
-    
-    creation_str = get_egypt_time(datetime.fromtimestamp(((int(user_id) >> 22) + 1420070400000) / 1000, tz=timezone.utc))
-    
-    embed = discord.Embed(title=f"👤 Profile Overview: @{username}")
-    embed.add_field(name="Identification", value=f"**Display Name:** {global_name}\n**Username:** `{username}`\n**User ID:** `{user_id}`", inline=False)
-    embed.add_field(name="Account Details", value=f"**Created On:** {creation_str}\n**Clan:** {clan_str}\n**Decoration:** {deco_str}", inline=False)
-    embed.add_field(name="About Me", value=bio, inline=False)
+    user_ids = get_command_user_ids(user_id)
+    if any(uid not in TARGET_USER_IDS for uid in user_ids):
+        return await ctx.send("❌ One or more requested users are not in the target list.")
+
+    embed = discord.Embed(title="👥 Profile Overview for Monitored Targets")
     embed.set_footer(text=f"Fetched at {get_egypt_time()}")
-    
+    any_success = False
+
+    for uid in user_ids:
+        data = await fetch_user_data(uid)
+        if not data:
+            embed.add_field(name=f"<@{uid}>", value="❌ Failed to fetch profile data.", inline=False)
+            continue
+
+        any_success = True
+        username = data.get("username", "Unknown")
+        global_name = data.get("global_name") or "None"
+        bio = data.get("bio") or "*No bio written*"
+
+        clan = data.get("clan")
+        clan_str = "*Not in a Clan*"
+        if clan:
+            clan_str = f"**₊ {clan.get('tag', 'No tag')}**"
+
+        deco = data.get("avatar_decoration_data")
+        deco_str = "*None*"
+        if deco:
+            deco_str = f"[Preview Link](https://cdn.discordapp.com/avatar-decorations/{deco.get('asset')}.png)"
+
+        creation_str = get_egypt_time(datetime.fromtimestamp(((int(uid) >> 22) + 1420070400000) / 1000, tz=timezone.utc))
+        member = get_server_member(uid)
+        status_str = f"**Status:** {getattr(member, 'status', 'Unknown')}" if member else "**Status:** Unknown (server member not cached)"
+
+        embed.add_field(
+            name=f"<@{uid}> • {username}",
+            value=f"{status_str}\n**Display Name:** {global_name}\n**Created On:** {creation_str}\n**Clan:** {clan_str}\n**Decoration:** {deco_str}\n\n**About:** {bio}",
+            inline=False
+        )
+
+    if not any_success:
+        return await ctx.send("❌ Could not fetch profile data for any requested user.")
+
     await send_message(ctx.channel.id, embed)
 
 @bot.command(name="about")
 async def _about(ctx, user_id: str = None):
-    if ctx.channel.id != COMMANDS_CHANNEL_ID: return
-    user_id = user_id or TARGET_USER_IDS[0]
-    
-    data = await fetch_user_data(user_id)
-    if not data: return await ctx.send("❌ Failed to fetch user data.")
-    
-    bio = data.get("bio") or "*This user hasn't written an about me section.*"
-    embed = discord.Embed(title=f"📝 About Me for <@{user_id}>", description=bio)
+    if ctx.channel.id != COMMANDS_CHANNEL_ID:
+        return
+
+    user_ids = get_command_user_ids(user_id)
+    if any(uid not in TARGET_USER_IDS for uid in user_ids):
+        return await ctx.send("❌ One or more requested users are not in the target list.")
+
+    embed = discord.Embed(title="📝 About Me for Monitored Targets")
+    embed.set_footer(text=f"Fetched at {get_egypt_time()}")
+    any_success = False
+
+    for uid in user_ids:
+        data = await fetch_user_data(uid)
+        if not data:
+            embed.add_field(name=f"<@{uid}>", value="❌ Failed to fetch about info.", inline=False)
+            continue
+
+        any_success = True
+        bio = data.get("bio") or "*This user hasn't written an about me section.*"
+        embed.add_field(name=f"<@{uid}>", value=bio, inline=False)
+
+    if not any_success:
+        return await ctx.send("❌ Could not fetch about information for any requested user.")
+
     await send_message(ctx.channel.id, embed)
 
 @bot.command(name="ss")
 async def _ss(ctx, user_id: str = None):
-    if ctx.channel.id != COMMANDS_CHANNEL_ID: return
-    user_id = user_id or TARGET_USER_IDS[0]
-    
-    await ctx.send(f"📸 `Initiating screenshot capture for <@{user_id}>... Please wait.`")
-    await screenshot_queue.put((ctx, user_id))
+    if ctx.channel.id != COMMANDS_CHANNEL_ID:
+        return
+
+    user_ids = get_command_user_ids(user_id)
+    if any(uid not in TARGET_USER_IDS for uid in user_ids):
+        return await ctx.send("❌ One or more requested users are not in the target list.")
+
+    for uid in user_ids:
+        await ctx.send(f"📸 `Initiating screenshot capture for <@{uid}>... Please wait.`")
+        await screenshot_queue.put((ctx, uid))
 
 @bot.command(name="activity")
 async def _activity(ctx, user_id: str = None):
-    if ctx.channel.id != COMMANDS_CHANNEL_ID: return
-    user_id = user_id or TARGET_USER_IDS[0]
-    
-    acts = current_activities.get(user_id, [])
-    if not acts:
-        return await ctx.send(f"💤 `<@{user_id}> is not doing any detectable activity right now.`")
-        
-    embed = discord.Embed(title=f"🎯 Live Activities for <@{user_id}>")
-    for act in acts:
-        started = act.get("start_time")
-        elapsed = str(datetime.now(timezone.utc) - started).split(".")[0] if started else "Unknown"
-        embed.add_field(name=act['name'], value=f"Started at: {get_egypt_time(started)}\nElapsed: **{elapsed}**", inline=False)
-        
+    if ctx.channel.id != COMMANDS_CHANNEL_ID:
+        return
+
+    user_ids = get_command_user_ids(user_id)
+    if any(uid not in TARGET_USER_IDS for uid in user_ids):
+        return await ctx.send("❌ One or more requested users are not in the target list.")
+
+    embed = discord.Embed(title="🎯 Live Activity Status for Monitored Targets")
+    embed.set_footer(text=f"Fetched at {get_egypt_time()}")
+    any_activity = False
+
+    for uid in user_ids:
+        acts = current_activities.get(uid, [])
+        member = get_server_member(uid)
+        if member and member.activities:
+            act_list = [act for act in member.activities if act.type != discord.ActivityType.custom]
+            if act_list:
+                acts = act_list
+
+        if not acts:
+            embed.add_field(name=f"<@{uid}>", value="💤 No detectable activity right now.", inline=False)
+            continue
+
+        any_activity = True
+        text_lines = []
+        for act in acts:
+            started = getattr(act, 'start', None) or datetime.now(timezone.utc)
+            elapsed = str(datetime.now(timezone.utc) - started).split(".")[0] if started else "Unknown"
+            text_lines.append(f"**{getattr(act, 'name', str(act))}**\nStarted at: {get_egypt_time(started)}\nElapsed: **{elapsed}**")
+
+        embed.add_field(name=f"<@{uid}>", value="\n\n".join(text_lines), inline=False)
+
+    if not any_activity and len(embed.fields) == 0:
+        embed.add_field(name="Activity", value="No activities detected for the requested users.", inline=False)
+
     await send_message(ctx.channel.id, embed)
 
 @bot.command(name="lastseen")
 async def _lastseen(ctx, user_id: str = None):
-    if ctx.channel.id != COMMANDS_CHANNEL_ID: return
-    user_id = user_id or TARGET_USER_IDS[0]
-    
-    doc = await last_seen_col.find_one({"_id": user_id})
-    if not doc: return await ctx.send("❌ No historical tracking data available for this user yet.")
-    
-    embed = discord.Embed(title=f"⏱️ Last Seen Tracker for <@{user_id}>")
-    if doc.get("last_online"):
-        embed.add_field(name="🟢 Last Online", value=get_egypt_time(doc.get("last_online")), inline=False)
-    if doc.get("last_offline"):
-        embed.add_field(name="🔴 Last Offline", value=get_egypt_time(doc.get("last_offline")), inline=False)
-        
+    if ctx.channel.id != COMMANDS_CHANNEL_ID:
+        return
+
+    user_ids = get_command_user_ids(user_id)
+    if any(uid not in TARGET_USER_IDS for uid in user_ids):
+        return await ctx.send("❌ One or more requested users are not in the target list.")
+
+    embed = discord.Embed(title="⏱️ Last Seen Status for Monitored Targets")
+    embed.set_footer(text=f"Fetched at {get_egypt_time()}")
+
+    for uid in user_ids:
+        member = get_server_member(uid)
+        if member:
+            status = getattr(member, 'status', 'Unknown')
+            embed.add_field(name=f"<@{uid}>", value=f"Current status: **{status}**", inline=False)
+            continue
+
+        doc = await last_seen_col.find_one({"_id": uid})
+        if not doc:
+            embed.add_field(name=f"<@{uid}>", value="❌ No historical tracking data available yet.", inline=False)
+            continue
+
+        lines = []
+        if doc.get("last_online"):
+            lines.append(f"🟢 Last Online: {get_egypt_time(doc.get('last_online'))}")
+        if doc.get("last_offline"):
+            lines.append(f"🔴 Last Offline: {get_egypt_time(doc.get('last_offline'))}")
+        embed.add_field(name=f"<@{uid}>", value="\n".join(lines) or "No last-seen history found.", inline=False)
+
     await send_message(ctx.channel.id, embed)
 
 @bot.command(name="lastactivity")
 async def _lastactivity(ctx, user_id: str = None):
-    if ctx.channel.id != COMMANDS_CHANNEL_ID: return
-    user_id = user_id or TARGET_USER_IDS[0]
-    
-    doc = await last_activity_col.find_one({"_id": user_id})
-    if not doc: return await ctx.send("❌ No previous activities have been recorded.")
-    
-    embed = discord.Embed(title=f"📜 Last Completed Activity for <@{user_id}>")
-    embed.add_field(name="Activity Name", value=f"🎮 **{doc.get('activity_name', 'Unknown')}**", inline=False)
-    embed.add_field(name="Timeline", value=f"**Start:** {get_egypt_time(doc.get('start'))}\n**End:** {get_egypt_time(doc.get('end'))}", inline=False)
-    embed.add_field(name="Total Duration", value=f"⏳ {doc.get('duration', 'Unknown')}", inline=False)
-    
+    if ctx.channel.id != COMMANDS_CHANNEL_ID:
+        return
+
+    user_ids = get_command_user_ids(user_id)
+    if any(uid not in TARGET_USER_IDS for uid in user_ids):
+        return await ctx.send("❌ One or more requested users are not in the target list.")
+
+    embed = discord.Embed(title="📜 Last Activity History for Monitored Targets")
+    embed.set_footer(text=f"Fetched at {get_egypt_time()}")
+
+    for uid in user_ids:
+        doc = await last_activity_col.find_one({"_id": uid})
+        if not doc:
+            embed.add_field(name=f"<@{uid}>", value="❌ No previous activities have been recorded.", inline=False)
+            continue
+
+        embed.add_field(
+            name=f"<@{uid}>",
+            value=f"🎮 **{doc.get('activity_name', 'Unknown')}**\n**Start:** {get_egypt_time(doc.get('start'))}\n**End:** {get_egypt_time(doc.get('end'))}\n**Duration:** ⏳ {doc.get('duration', 'Unknown')}",
+            inline=False
+        )
+
     await send_message(ctx.channel.id, embed)
 
 # ==================== مراقبة الحالة والأنشطة (Live Monitoring) ====================
