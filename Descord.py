@@ -94,60 +94,24 @@ async def save_page_debug_screenshot(page, label: str, user_id: str):
     except Exception as exc:
         log_exception("save_page_debug_screenshot", exc, user_id=user_id, label=label)
 
-async def save_page_debug_html(page, label: str, user_id: str):
-    try:
-        filename = os.path.join(DEBUG_DUMP_DIR, f"page_html_{label}_{user_id}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.html")
-        content = await page.content()
-        with open(filename, "w", encoding="utf-8") as html_file:
-            html_file.write(content)
-        logger.info(f"DEBUG_PAGEHTML_SAVED | {filename}")
-    except Exception as exc:
-        log_exception("save_page_debug_html", exc, user_id=user_id, label=label)
-
 async def capture_page_debug_state(page, label: str, user_id: str):
     try:
         url = page.url
         title = await page.title()
-        ready_state = await page.evaluate("() => document.readyState")
         cookies = await page.context.cookies()
         content_snippet = await page.content()
-
         try:
-            page_state_json = await page.evaluate(
+            local_storage = await page.evaluate(
                 "() => {\n"
                 "  try {\n"
-                "    const localStorageData = {}\n"
-                "    const sessionStorageData = {}\n"
-                "    for (let i = 0; i < window.localStorage.length; i++) {\n"
-                "      const key = window.localStorage.key(i);\n"
-                "      localStorageData[key] = window.localStorage.getItem(key);\n"
-                "    }\n"
-                "    for (let i = 0; i < window.sessionStorage.length; i++) {\n"
-                "      const key = window.sessionStorage.key(i);\n"
-                "      sessionStorageData[key] = window.sessionStorage.getItem(key);\n"
-                "    }\n"
-                "    return JSON.stringify({\n"
-                "      location: window.location.href,\n"
-                "      readyState: document.readyState,\n"
-                "      title: document.title,\n"
-                "      userAgent: navigator.userAgent,\n"
-                "      platform: navigator.platform,\n"
-                "      languages: navigator.languages,\n"
-                "      webdriver: navigator.webdriver,\n"
-                "      notificationPermission: Notification.permission,\n"
-                "      localStorage: localStorageData,\n"
-                "      sessionStorage: sessionStorageData\n"
-                "    });\n"
+                "    return JSON.stringify(Object.fromEntries(Object.entries(window.localStorage)));\n"
                 "  } catch (e) {\n"
-                "    return JSON.stringify({ error: e.message, stack: e.stack });\n"
+                "    return `LOCAL_STORAGE_ERROR:${e.message}`;\n"
                 "  }\n"
                 "}"
             )
-            client_state = json.loads(page_state_json)
-        except Exception as state_exc:
-            client_state = {
-                "client_state_eval_error": str(state_exc)
-            }
+        except Exception as storage_exc:
+            local_storage = f"LOCAL_STORAGE_EVAL_FAILED:{storage_exc}"
 
         try:
             storage_state = await page.context.storage_state()
@@ -160,9 +124,8 @@ async def capture_page_debug_state(page, label: str, user_id: str):
             f"user_id={user_id}\n"
             f"url={url}\n"
             f"title={title}\n"
-            f"readyState={ready_state}\n"
             f"cookies={json.dumps(cookies, default=str)}\n"
-            f"clientState={json.dumps(client_state, default=str, ensure_ascii=False)}\n"
+            f"localStorage={local_storage}\n"
             f"storageState={storage_state}\n"
             f"content_snippet={content_snippet[:2500]}\n"
         )
@@ -172,6 +135,29 @@ async def capture_page_debug_state(page, label: str, user_id: str):
         logger.info(f"DEBUG_DUMP_SAVED | {filename}")
     except Exception as exc:
         log_exception("capture_page_debug_state", exc, user_id=user_id, label=label)
+
+async def capture_page_summary(page, label: str, user_id: str):
+    try:
+        url = page.url
+        title = await page.title()
+        local_storage = "unavailable"
+        try:
+            raw_ls = await page.evaluate(
+                "() => { try { return JSON.stringify(Object.fromEntries(Object.entries(window.localStorage))); } catch (e) { return `LOCAL_STORAGE_ERROR:${e.message}`; } }"
+            )
+            if raw_ls and raw_ls.startswith("LOCAL_STORAGE_ERROR"):
+                local_storage = raw_ls
+            else:
+                parsed = json.loads(raw_ls or "{}")
+                local_storage = f"keys={len(parsed)} names={list(parsed.keys())[:6]}"
+        except Exception as storage_exc:
+            local_storage = f"LOCAL_STORAGE_EVAL_FAILED:{storage_exc}"
+
+        logger.info(
+            f"DEBUG_SUMMARY | {label} | user={user_id} | url={url} | title={title} | localStorage={local_storage}"
+        )
+    except Exception as exc:
+        log_exception("capture_page_summary", exc, user_id=user_id, label=label)
 
 
 def embed_to_text(embed: discord.Embed) -> str:
@@ -261,13 +247,14 @@ async def send_message_with_file(channel_id: int, embed: discord.Embed, file_byt
         
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers={"Authorization": USER_TOKEN}, data=form) as resp:
+                response_text = await resp.text()
                 if resp.status == 200:
-                    logger.info("📸 Sent message with screenshot file")
-                    log_step("HTTP_FILE", "File message sent successfully", channel_id=channel_id, filename=filename)
+                    logger.info(f"📸 Sent message with screenshot file | channel={channel_id} | filename={filename} | bytes={file_bytes.getbuffer().nbytes}")
+                    log_step("HTTP_FILE", "File message sent successfully", channel_id=channel_id, filename=filename, bytes=file_bytes.getbuffer().nbytes)
                 else:
-                    text = await resp.text()
-                    logger.error(f"❌ Failed to send file: {resp.status} {text}")
-                    log_step("HTTP_FILE", "File message send failed", channel_id=channel_id, filename=filename, status=resp.status, response=text)
+                    logger.error(f"❌ File upload failed | status={resp.status} | channel={channel_id} | filename={filename}")
+                    log_step("HTTP_FILE", "File message send failed", channel_id=channel_id, filename=filename, status=resp.status, response=response_text[:1000])
+                    logger.error(f"HTTP_FILE_RESPONSE | {response_text[:1000]}")
     except Exception as exc:
         log_exception("send_message_with_file", exc, channel_id=channel_id, filename=filename)
 
@@ -413,14 +400,17 @@ def get_server_member(user_id: str) -> discord.Member | None:
 
 async def take_profile_screenshot(user_id: str) -> io.BytesIO:
     try:
-        log_step("SCREENSHOT", "Starting Playwright profile capture", user_id=user_id)
+        log_step("SCREENSHOT", "Start capture process", user_id=user_id)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            log_step("SCREENSHOT", "Browser launched", user_id=user_id)
+
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 device_scale_factor=2,
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
+            log_step("SCREENSHOT", "Browser context created", user_id=user_id)
 
             stealth_script = (
                 "() => {"
@@ -435,85 +425,92 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
             await context.add_init_script(script=stealth_script)
 
             token_script = (
-                f"(() => {{ "
-                f"  try {{ "
-                f"    const ls = window.localStorage; "
-                f"    if (!ls) return 'NO_LOCAL_STORAGE'; "
-                f"    ls.setItem('token', {json.dumps(USER_TOKEN)}); "
-                f"    return 'TOKEN_SET'; "
-                f"  }} catch (error) {{ "
-                f"    return `TOKEN_ERROR:${{error.message}}`; "
-                f"  }} "
+                f"(() => {{"
+                f"  try {{"
+                f"    const ls = window.localStorage;"
+                f"    if (!ls) return 'NO_LOCAL_STORAGE';"
+                f"    ls.setItem('token', {json.dumps(USER_TOKEN)});"
+                f"    return 'TOKEN_SET';"
+                f"  }} catch (e) {{"
+                f"    return `TOKEN_SCRIPT_ERROR:${{e.message}}`;"
+                f"  }}"
                 f"}})();"
             )
             await context.add_init_script(script=token_script)
+            log_step("SCREENSHOT", "Init scripts installed", user_id=user_id)
 
             page = await context.new_page()
-            page.on("request", lambda request: logger.debug(f"PAGE_REQUEST | {user_id} | {request.method} {request.url}"))
-            page.on("response", lambda response: logger.debug(f"PAGE_RESPONSE | {user_id} | {response.status} {response.url}"))
-            page.on("console", lambda msg: logger.debug(f"PAGE_CONSOLE | {user_id} | {msg.type} | {msg.text}"))
-            page.on("pageerror", lambda exc: logger.error(f"PAGE_ERROR | {user_id} | {exc}"))
-
             await page.add_init_script(script=stealth_script)
             await page.add_init_script(script=token_script)
+            log_step("SCREENSHOT", "Page created with init scripts", user_id=user_id)
 
             await page.goto("https://discord.com/login?redirect_to=%2Fchannels%2F%40me", wait_until="networkidle", timeout=60000)
             await page.wait_for_load_state("domcontentloaded", timeout=60000)
-            await capture_page_debug_state(page, "initial_navigate", user_id)
-            await save_page_debug_html(page, "initial_navigate", user_id)
+            await capture_page_summary(page, "initial_navigate", user_id)
 
-            if "login" in page.url or "discord.com/login" in page.url:
-                log_step("SCREENSHOT", "Login page detected after initial auth injection", user_id=user_id, page_url=page.url)
+            if "discord.com/login" in page.url or page.url.endswith("/login"):
+                log_step("SCREENSHOT", "Login page still visible after navigation", user_id=user_id, page_url=page.url)
                 try:
                     token_result = await page.evaluate(token_script)
-                    log_step("SCREENSHOT", "Token injection result", user_id=user_id, token_result=token_result)
-                    await asyncio.sleep(3)
-                    await page.goto("https://discord.com/channels/@me", wait_until="networkidle", timeout=60000)
-                    await capture_page_debug_state(page, "after_first_token_eval", user_id)
-                    await save_page_debug_html(page, "after_first_token_eval", user_id)
+                    log_step("SCREENSHOT", "First token injection executed", user_id=user_id, token_result=token_result)
                 except Exception as eval_exc:
                     log_exception("SCREENSHOT_EVAL", eval_exc, user_id=user_id)
 
-            if "login" in page.url or "discord.com/login" in page.url:
-                log_step("SCREENSHOT", "Retrying login injection on login page", user_id=user_id, page_url=page.url)
+                await asyncio.sleep(2)
+                await page.goto("https://discord.com/channels/@me", wait_until="networkidle", timeout=60000)
+                await page.wait_for_load_state("domcontentloaded", timeout=60000)
+                await capture_page_summary(page, "after_first_token_eval", user_id)
+
+            if "discord.com/login" in page.url or page.url.endswith("/login"):
+                log_step("SCREENSHOT", "Retrying token injection and reload", user_id=user_id, page_url=page.url)
                 try:
                     token_result = await page.evaluate(token_script)
-                    log_step("SCREENSHOT", "Token injection retry result", user_id=user_id, token_result=token_result)
+                    log_step("SCREENSHOT", "Second token injection executed", user_id=user_id, token_result=token_result)
                 except Exception as eval_exc:
                     log_exception("SCREENSHOT_EVAL_RETRY", eval_exc, user_id=user_id)
-                await asyncio.sleep(3)
+
+                await asyncio.sleep(2)
                 await page.reload(wait_until="networkidle", timeout=60000)
                 await page.wait_for_load_state("domcontentloaded", timeout=60000)
-                await capture_page_debug_state(page, "after_reload", user_id)
-                await save_page_debug_html(page, "after_reload", user_id)
+                await capture_page_summary(page, "after_reload", user_id)
 
-            if "login" in page.url or "discord.com/login" in page.url:
-                log_step("SCREENSHOT", "Navigating directly to user profile after auth retries", user_id=user_id, target_url=f"https://discord.com/users/{user_id}")
+            if "discord.com/login" in page.url or page.url.endswith("/login"):
+                log_step("SCREENSHOT", "Navigating directly to target profile", user_id=user_id, target_url=f"https://discord.com/users/{user_id}")
                 await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
                 await page.wait_for_load_state("domcontentloaded", timeout=60000)
-                await capture_page_debug_state(page, "after_profile_navigate", user_id)
-                await save_page_debug_html(page, "after_profile_navigate", user_id)
+                await capture_page_summary(page, "after_profile_navigation", user_id)
 
+            profile_selector = "div[class*='profile']"
             try:
-                await page.locator("div[class*='profile']").first.wait_for(timeout=20000)
+                await page.locator(profile_selector).first.wait_for(timeout=20000)
+                log_step("SCREENSHOT", "Profile area detected", user_id=user_id, page_url=page.url)
             except Exception as selector_exc:
-                logger.warning(f"Profile screenshot selector timeout for user {user_id}, page_url={page.url}")
+                logger.warning(f"Profile area not detected for {user_id}; may still be login or page changed | url={page.url}")
                 log_exception("SCREENSHOT_SELECTOR_TIMEOUT", selector_exc, user_id=user_id, page_url=page.url)
-                await capture_page_debug_state(page, "selector_timeout", user_id)
-                await save_page_debug_html(page, "selector_timeout", user_id)
+                await capture_page_summary(page, "profile_selector_missing", user_id)
 
-            if "login" in page.url or "discord.com/login" in page.url:
+            if "discord.com/login" in page.url or page.url.endswith("/login"):
                 page_dump = await page.content()
-                logger.error(f"SCREENSHOT_AUTH_FAILED: login page still visible for user {user_id}, url={page.url}, content_snippet={page_dump[:1000]}")
+                logger.error(
+                    f"SCREENSHOT_AUTH_FAILED | user={user_id} | url={page.url} | login page still visible | snippet={page_dump[:600].replace('\n', ' ')}"
+                )
                 await save_page_debug_screenshot(page, "final_login_failure", user_id)
-                await save_page_debug_html(page, "final_login_failure", user_id)
                 await capture_page_debug_state(page, "final_login_failure", user_id)
-                raise RuntimeError(f"Authentication failed - still on login page for user {user_id}")
+                raise RuntimeError(f"Authentication failed; still on login page for user {user_id}")
 
             screenshot = await page.screenshot(full_page=True)
-            await save_page_debug_screenshot(page, "final_success", user_id)
+            screenshot_length = len(screenshot)
+            log_step("SCREENSHOT", "Screenshot taken", user_id=user_id, size=screenshot_length, page_url=page.url)
+
+            if screenshot_length == 0:
+                logger.error(f"SCREENSHOT_EMPTY_IMAGE | user={user_id} | url={page.url}")
+                await save_page_debug_screenshot(page, "empty_screenshot_failure", user_id)
+                await capture_page_debug_state(page, "empty_screenshot_failure", user_id)
+                await browser.close()
+                return io.BytesIO(b'')
+
             await browser.close()
-            log_step("SCREENSHOT", "Playwright profile capture completed", user_id=user_id, size=len(screenshot), page_url=page.url)
+            log_step("SCREENSHOT", "Capture completed successfully", user_id=user_id, size=screenshot_length)
             return io.BytesIO(screenshot)
     except Exception as e:
         log_exception("take_profile_screenshot", e, user_id=user_id)
