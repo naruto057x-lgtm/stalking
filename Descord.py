@@ -245,12 +245,6 @@ async def on_ready():
     bot.loop.create_task(profile_check_loop())
     bot.loop.create_task(screenshot_worker())
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.id != bot.user.id:
-        return
-    await bot.process_commands(message)
-
 # ==================== الأوامر ====================
 @bot.command(name="status")
 async def status_check(ctx):
