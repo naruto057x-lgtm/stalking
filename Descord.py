@@ -59,6 +59,14 @@ def log_step(step: str, message: str, **details):
     else:
         logger.info("[DEBUG] %s | %s", step, message)
 
+
+def log_exception(context: str, exc: Exception, **details):
+    detail_text = " | ".join(f"{k}={v}" for k, v in details.items()) if details else ""
+    if detail_text:
+        logger.exception("[ERROR] %s | %s | %s", context, exc, detail_text)
+    else:
+        logger.exception("[ERROR] %s | %s", context, exc)
+
 # ==================== دوال الوقت ====================
 def get_egypt_time(dt: datetime = None) -> str:
     if dt is None:
@@ -102,64 +110,109 @@ async def human_delay():
 
 async def send_message(channel_id: int, embed: discord.Embed) -> int:
     """إرسال الرسالة المنسقة إلى القناة مع تأخير بشري"""
-    log_step("HTTP_SEND", "Preparing to send message", channel_id=channel_id, embed_title=getattr(embed, "title", None))
-    await human_delay() # 👈 حماية ضد السبام
-    url = f"{BASE_API}/channels/{channel_id}/messages"
-    payload = {"content": embed_to_text(embed)}
-    log_step("HTTP_SEND", "Sending payload", channel_id=channel_id, payload_length=len(payload["content"]))
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=HEADERS, json=payload) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                logger.info(f"✅ Sent message to channel {channel_id}")
-                log_step("HTTP_SEND", "Message sent successfully", channel_id=channel_id, message_id=data.get("id"))
-                return int(data["id"])
-            else:
-                text = await resp.text()
-                logger.error(f"❌ Failed to send message: {resp.status} {text}")
-                log_step("HTTP_SEND", "Message send failed", channel_id=channel_id, status=resp.status, response=text)
-                return 0
+    log_step("HTTP_SEND", "Preparing to send embed message", channel_id=channel_id, embed_title=getattr(embed, "title", None))
+    try:
+        await human_delay()
+        url = f"{BASE_API}/channels/{channel_id}/messages"
+        payload = {"content": embed_to_text(embed)}
+        log_step("HTTP_SEND", "Sending embed payload", channel_id=channel_id, payload_length=len(payload["content"]))
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=HEADERS, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.info(f"✅ Sent message to channel {channel_id}")
+                    log_step("HTTP_SEND", "Embed message sent successfully", channel_id=channel_id, message_id=data.get("id"))
+                    return int(data["id"])
+                else:
+                    text = await resp.text()
+                    logger.error(f"❌ Failed to send message: {resp.status} {text}")
+                    log_step("HTTP_SEND", "Embed message send failed", channel_id=channel_id, status=resp.status, response=text)
+                    return 0
+    except Exception as exc:
+        log_exception("send_message", exc, channel_id=channel_id)
+        return 0
 
 async def edit_message(channel_id: int, message_id: int, embed: discord.Embed):
     """تعديل رسالة موجودة بنص جديد"""
-    log_step("HTTP_EDIT", "Preparing to edit message", channel_id=channel_id, message_id=message_id)
-    await human_delay()
-    url = f"{BASE_API}/channels/{channel_id}/messages/{message_id}"
-    payload = {"content": embed_to_text(embed)}
-    log_step("HTTP_EDIT", "Editing payload", channel_id=channel_id, message_id=message_id, payload_length=len(payload["content"]))
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.patch(url, headers=HEADERS, json=payload) as resp:
-            if resp.status == 200:
-                logger.info(f"✏️ Edited message {message_id}")
-                log_step("HTTP_EDIT", "Message edited successfully", channel_id=channel_id, message_id=message_id)
-            else:
-                text = await resp.text()
-                logger.error(f"❌ Failed to edit message: {resp.status} {text}")
-                log_step("HTTP_EDIT", "Message edit failed", channel_id=channel_id, message_id=message_id, status=resp.status, response=text)
+    log_step("HTTP_EDIT", "Preparing to edit existing message", channel_id=channel_id, message_id=message_id)
+    try:
+        await human_delay()
+        url = f"{BASE_API}/channels/{channel_id}/messages/{message_id}"
+        payload = {"content": embed_to_text(embed)}
+        log_step("HTTP_EDIT", "Editing payload", channel_id=channel_id, message_id=message_id, payload_length=len(payload["content"]))
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.patch(url, headers=HEADERS, json=payload) as resp:
+                if resp.status == 200:
+                    logger.info(f"✏️ Edited message {message_id}")
+                    log_step("HTTP_EDIT", "Message edited successfully", channel_id=channel_id, message_id=message_id)
+                else:
+                    text = await resp.text()
+                    logger.error(f"❌ Failed to edit message: {resp.status} {text}")
+                    log_step("HTTP_EDIT", "Message edit failed", channel_id=channel_id, message_id=message_id, status=resp.status, response=text)
+    except Exception as exc:
+        log_exception("edit_message", exc, channel_id=channel_id, message_id=message_id)
 
 async def send_message_with_file(channel_id: int, embed: discord.Embed, file_bytes: io.BytesIO, filename: str):
     """إرسال رسالة مع صورة (لقطة الشاشة)"""
     log_step("HTTP_FILE", "Preparing to send file message", channel_id=channel_id, filename=filename, file_size=file_bytes.getbuffer().nbytes)
-    await human_delay()
-    url = f"{BASE_API}/channels/{channel_id}/messages"
-    form = aiohttp.FormData()
-    
-    payload = {"content": embed_to_text(embed)}
-    form.add_field("payload_json", json.dumps(payload), content_type="application/json")
-    form.add_field("file", file_bytes.getvalue(), filename=filename, content_type="image/png")
-    log_step("HTTP_FILE", "Uploading file payload", channel_id=channel_id, filename=filename)
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers={"Authorization": USER_TOKEN}, data=form) as resp:
-            if resp.status == 200:
-                logger.info("📸 Sent message with screenshot file")
-                log_step("HTTP_FILE", "File message sent successfully", channel_id=channel_id, filename=filename)
-            else:
-                text = await resp.text()
-                logger.error(f"❌ Failed to send file: {resp.status} {text}")
-                log_step("HTTP_FILE", "File message send failed", channel_id=channel_id, filename=filename, status=resp.status, response=text)
+    try:
+        await human_delay()
+        url = f"{BASE_API}/channels/{channel_id}/messages"
+        form = aiohttp.FormData()
+        
+        payload = {"content": embed_to_text(embed)}
+        form.add_field("payload_json", json.dumps(payload), content_type="application/json")
+        form.add_field("file", file_bytes.getvalue(), filename=filename, content_type="image/png")
+        log_step("HTTP_FILE", "Uploading file payload", channel_id=channel_id, filename=filename)
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers={"Authorization": USER_TOKEN}, data=form) as resp:
+                if resp.status == 200:
+                    logger.info("📸 Sent message with screenshot file")
+                    log_step("HTTP_FILE", "File message sent successfully", channel_id=channel_id, filename=filename)
+                else:
+                    text = await resp.text()
+                    logger.error(f"❌ Failed to send file: {resp.status} {text}")
+                    log_step("HTTP_FILE", "File message send failed", channel_id=channel_id, filename=filename, status=resp.status, response=text)
+    except Exception as exc:
+        log_exception("send_message_with_file", exc, channel_id=channel_id, filename=filename)
+
+async def send_text_message(channel_id: int, text: str):
+    """إرسال رسالة نصية بسيطة عبر HTTP"""
+    log_step("HTTP_TEXT", "Preparing to send text message", channel_id=channel_id, text_length=len(text))
+    try:
+        await human_delay()
+        url = f"{BASE_API}/channels/{channel_id}/messages"
+        payload = {"content": text}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=HEADERS, json=payload) as resp:
+                if resp.status == 200:
+                    logger.info(f"💬 Sent text message to channel {channel_id}")
+                    log_step("HTTP_TEXT", "Text message sent successfully", channel_id=channel_id)
+                else:
+                    raw = await resp.text()
+                    logger.error(f"❌ Failed to send text message: {resp.status} {raw}")
+                    log_step("HTTP_TEXT", "Text message send failed", channel_id=channel_id, status=resp.status, response=raw)
+    except Exception as exc:
+        log_exception("send_text_message", exc, channel_id=channel_id)
+
+class SimpleCommandContext:
+    def __init__(self, message: discord.Message):
+        self.message = message
+        self.channel = message.channel
+        self.author = message.author
+        self.guild = getattr(message, "guild", None)
+        self.bot = bot
+
+    async def send(self, content: str = None, *, embed: discord.Embed = None):
+        if embed is not None:
+            await send_message(self.channel.id, embed)
+            return
+        if content is None:
+            return
+        await send_text_message(self.channel.id, str(content))
 
 # ==================== إعداد البوت و MongoDB ====================
 try:
@@ -282,35 +335,78 @@ async def on_ready():
     logger.info(f"👤 Selfbot logged in as {bot.user}")
     log_step("READY", "Bot is ready; sending startup notification", user=str(bot.user))
 
-    embed = discord.Embed(
-        title="⚡ Discord Monitor System Online",
-        description=f"**Selfbot:** {bot.user.mention}\nAll systems are fully operational with Anti-Ban active.\nUse `!help` in this channel for commands."
-    )
-    embed.set_footer(text="System Initialized")
-    await send_message(COMMANDS_CHANNEL_ID, embed)
+    try:
+        embed = discord.Embed(
+            title="⚡ Discord Monitor System Online",
+            description=f"**Selfbot:** {bot.user.mention}\nAll systems are fully operational with Anti-Ban active.\nUse `!help` in this channel for commands."
+        )
+        embed.set_footer(text="System Initialized")
+        await send_message(COMMANDS_CHANNEL_ID, embed)
+    except Exception as exc:
+        log_exception("on_ready startup message", exc)
 
     log_step("READY", "Starting background tasks", profile_loop=True, screenshot_worker=True)
-    bot.loop.create_task(profile_check_loop())
-    bot.loop.create_task(screenshot_worker())
+    try:
+        bot.loop.create_task(profile_check_loop())
+        bot.loop.create_task(screenshot_worker())
+    except Exception as exc:
+        log_exception("on_ready background task start", exc)
 
 @bot.event
 async def on_message(message: discord.Message):
     log_step("MESSAGE", "Received message event", author_id=message.author.id if message.author else None, channel_id=message.channel.id if message.channel else None, content=message.content)
 
-    if message.author.bot:
-        log_step("MESSAGE", "Ignored message because the author is a bot or system account", author_id=message.author.id if message.author else None)
-        return
+    try:
+        if message.author.bot:
+            log_step("MESSAGE", "Ignored message because the author is a bot or system account", author_id=message.author.id if message.author else None)
+            return
 
-    if message.channel.id != COMMANDS_CHANNEL_ID:
-        log_step("MESSAGE", "Ignored message because channel is not the commands channel", channel_id=message.channel.id if message.channel else None, expected_channel_id=COMMANDS_CHANNEL_ID)
-        return
+        if message.channel.id != COMMANDS_CHANNEL_ID:
+            log_step("MESSAGE", "Ignored message because channel is not the commands channel", channel_id=message.channel.id if message.channel else None, expected_channel_id=COMMANDS_CHANNEL_ID)
+            return
 
-    if not message.content.startswith("!"):
-        log_step("MESSAGE", "Ignored message because it does not start with the command prefix", content=message.content)
-        return
+        if not message.content.startswith("!"):
+            log_step("MESSAGE", "Ignored message because it does not start with the command prefix", content=message.content)
+            return
 
-    log_step("MESSAGE", "Forwarding command message to command processor", content=message.content, author_id=message.author.id if message.author else None)
-    await bot.process_commands(message)
+        content = message.content.strip()
+        parts = content.split()
+        command_name = parts[0][1:].lower()
+        args = parts[1:]
+
+        log_step("MESSAGE", "Routing command manually", command=command_name, args=args, author_id=message.author.id if message.author else None)
+
+        ctx = SimpleCommandContext(message)
+
+        if command_name in {"help", "commands", "cmd"}:
+            log_step("COMMAND_ROUTE", "Executing help command", command=command_name, author_id=message.author.id)
+            await custom_help(ctx)
+        elif command_name == "status":
+            log_step("COMMAND_ROUTE", "Executing status command", command=command_name, author_id=message.author.id)
+            await status_check(ctx)
+        elif command_name == "profile":
+            log_step("COMMAND_ROUTE", "Executing profile command", command=command_name, author_id=message.author.id, user_id=args[0] if args else None)
+            await _profile(ctx, args[0] if args else None)
+        elif command_name == "about":
+            log_step("COMMAND_ROUTE", "Executing about command", command=command_name, author_id=message.author.id, user_id=args[0] if args else None)
+            await _about(ctx, args[0] if args else None)
+        elif command_name == "ss":
+            log_step("COMMAND_ROUTE", "Executing ss command", command=command_name, author_id=message.author.id, user_id=args[0] if args else None)
+            await _ss(ctx, args[0] if args else None)
+        elif command_name == "activity":
+            log_step("COMMAND_ROUTE", "Executing activity command", command=command_name, author_id=message.author.id, user_id=args[0] if args else None)
+            await _activity(ctx, args[0] if args else None)
+        elif command_name == "lastseen":
+            log_step("COMMAND_ROUTE", "Executing lastseen command", command=command_name, author_id=message.author.id, user_id=args[0] if args else None)
+            await _lastseen(ctx, args[0] if args else None)
+        elif command_name == "lastactivity":
+            log_step("COMMAND_ROUTE", "Executing lastactivity command", command=command_name, author_id=message.author.id, user_id=args[0] if args else None)
+            await _lastactivity(ctx, args[0] if args else None)
+        else:
+            log_step("COMMAND_ROUTE", "Unknown command received", command=command_name, author_id=message.author.id)
+            await ctx.send(f"❌ Unknown command: `!{command_name}`")
+    except Exception as exc:
+        log_exception("on_message command handling", exc, command=content)
 
 # ==================== الأوامر ====================
 @bot.command(name="status")
@@ -567,62 +663,66 @@ async def profile_check_loop():
     await bot.wait_until_ready()
     log_step("PROFILE_LOOP", "Profile surveillance loop started")
     
-    startup_embed = discord.Embed(title="🔄 Profile Surveillance Activated", description="Checking target profiles stealthily (~ every 60s).")
-    await send_message(CHANGES_CHANNEL_ID, startup_embed)
+    try:
+        startup_embed = discord.Embed(title="🔄 Profile Surveillance Activated", description="Checking target profiles stealthily (~ every 60s).")
+        await send_message(CHANGES_CHANNEL_ID, startup_embed)
+    except Exception as exc:
+        log_exception("profile_check_loop startup notification", exc)
     
     while not bot.is_closed():
         for uid in TARGET_USER_IDS:
             log_step("PROFILE_LOOP", "Starting profile check cycle", user_id=uid)
-            await asyncio.sleep(random.uniform(1.5, 3.5)) # 👈 تأخير بين فحص كل شخص والتاني
-            
-            data = await fetch_user_data(uid)
-            if not data:
-                log_step("PROFILE_LOOP", "Profile fetch returned no data", user_id=uid)
-                continue
-            
-            log_step("PROFILE_LOOP", "Profile data fetched", user_id=uid, username=data.get("username"))
-            cached = await profile_cache_col.find_one({"_id": uid})
-            new_cache = {
-                "username": data.get("username"),
-                "global_name": data.get("global_name"),
-                "bio": data.get("bio"),
-                "avatar": data.get("avatar"),
-                "banner": data.get("banner"),
-                "clan_tag": data.get("clan", {}).get("tag") if data.get("clan") else None,
-                "avatar_decoration": data.get("avatar_decoration_data", {}).get("asset") if data.get("avatar_decoration_data") else None
-            }
-            
-            changes = []
-            if cached:
-                for key in new_cache:
-                    if new_cache[key] != cached.get(key):
-                        title = key.replace('_', ' ').title()
-                        changes.append(f"**{title}**\n> 🛑 Old: `{cached.get(key)}`\n> ✅ New: `{new_cache[key]}`\n")
+            try:
+                await asyncio.sleep(random.uniform(1.5, 3.5))
+                data = await fetch_user_data(uid)
+                if not data:
+                    log_step("PROFILE_LOOP", "Profile fetch returned no data", user_id=uid)
+                    continue
+                
+                log_step("PROFILE_LOOP", "Profile data fetched", user_id=uid, username=data.get("username"))
+                cached = await profile_cache_col.find_one({"_id": uid})
+                new_cache = {
+                    "username": data.get("username"),
+                    "global_name": data.get("global_name"),
+                    "bio": data.get("bio"),
+                    "avatar": data.get("avatar"),
+                    "banner": data.get("banner"),
+                    "clan_tag": data.get("clan", {}).get("tag") if data.get("clan") else None,
+                    "avatar_decoration": data.get("avatar_decoration_data", {}).get("asset") if data.get("avatar_decoration_data") else None
+                }
+                
+                changes = []
+                if cached:
+                    for key in new_cache:
+                        if new_cache[key] != cached.get(key):
+                            title = key.replace('_', ' ').title()
+                            changes.append(f"**{title}**\n> 🛑 Old: `{cached.get(key)}`\n> ✅ New: `{new_cache[key]}`\n")
+                            
+                if changes or not cached:
+                    if not cached:
+                        changes.append("*System cached the initial profile data successfully.*")
+                        log_step("PROFILE_LOOP", "No previous cache found; initial cache created", user_id=uid)
                         
-            if changes or not cached:
-                if not cached:
-                    changes.append("*System cached the initial profile data successfully.*")
-                    log_step("PROFILE_LOOP", "No previous cache found; initial cache created", user_id=uid)
+                    await profile_cache_col.update_one({"_id": uid}, {"$set": new_cache}, upsert=True)
+                    log_step("PROFILE_LOOP", "Profile cache updated", user_id=uid, changes_count=len(changes))
                     
-                await profile_cache_col.update_one({"_id": uid}, {"$set": new_cache}, upsert=True)
-                log_step("PROFILE_LOOP", "Profile cache updated", user_id=uid, changes_count=len(changes))
-                
-                embed = discord.Embed(
-                    title="⚠️ Profile Update Detected", 
-                    description=f"Changes found for <@{uid}>:\n\n" + "\n".join(changes)
-                )
-                embed.set_footer(text=f"Change recorded at {get_egypt_time()}")
-                log_step("PROFILE_LOOP", "Preparing profile change notification", user_id=uid, change_text="\n".join(changes))
-                
-                screenshot = await take_profile_screenshot(uid)
-                if screenshot.getbuffer().nbytes > 0:
-                    log_step("PROFILE_LOOP", "Sending profile screenshot notification", user_id=uid)
-                    await send_message_with_file(CHANGES_CHANNEL_ID, embed, screenshot, f"update_{uid}.png")
-                else:
-                    log_step("PROFILE_LOOP", "Sending text-only profile notification", user_id=uid)
-                    await send_message(CHANGES_CHANNEL_ID, embed)
+                    embed = discord.Embed(
+                        title="⚠️ Profile Update Detected", 
+                        description=f"Changes found for <@{uid}>:\n\n" + "\n".join(changes)
+                    )
+                    embed.set_footer(text=f"Change recorded at {get_egypt_time()}")
+                    log_step("PROFILE_LOOP", "Preparing profile change notification", user_id=uid, change_text="\n".join(changes))
                     
-        # 👈 السر في الحماية: التكرار عشوائي بين 58 و 85 ثانية بدل 60 ثانية بالضبط
+                    screenshot = await take_profile_screenshot(uid)
+                    if screenshot.getbuffer().nbytes > 0:
+                        log_step("PROFILE_LOOP", "Sending profile screenshot notification", user_id=uid)
+                        await send_message_with_file(CHANGES_CHANNEL_ID, embed, screenshot, f"update_{uid}.png")
+                    else:
+                        log_step("PROFILE_LOOP", "Sending text-only profile notification", user_id=uid)
+                        await send_message(CHANGES_CHANNEL_ID, embed)
+            except Exception as exc:
+                log_exception("profile_check_loop cycle", exc, user_id=uid)
+                
         cooldown = random.randint(58, 85)
         log_step("PROFILE_LOOP", "Sleeping before next profile cycle", cooldown=cooldown)
         await asyncio.sleep(cooldown)
@@ -644,7 +744,7 @@ async def screenshot_worker():
                 log_step("SCREENSHOT_WORKER", "Sending captured screenshot", user_id=user_id)
                 await send_message_with_file(ctx.channel.id, embed, screenshot, f"capture_{user_id}.png")
         except Exception as e:
-            logger.exception("[SCREENSHOT_WORKER] Fatal error during capture | user_id=%s | error=%s", user_id, e)
+            log_exception("screenshot_worker capture", e, user_id=user_id)
             await ctx.send(f"❌ `Fatal error during capture: {str(e)}`")
         finally:
             screenshot_queue.task_done()
