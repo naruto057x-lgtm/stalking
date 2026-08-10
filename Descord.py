@@ -411,7 +411,7 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
                     {
                         "origin": "https://discord.com",
                         "localStorage": [
-                            {"name": "token", "value": USER_TOKEN}
+                            {"name": "token", "value": f'"{USER_TOKEN}"'}
                         ]
                     }
                 ]
@@ -445,7 +445,14 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
             await capture_page_summary(page, "initial_navigate", user_id)
 
             if "discord.com/login" in page.url or page.url.endswith("/login"):
-                logger.warning(f"STORAGE_STATE_FAILED | login page still visible after storage_state navigation | user={user_id} | url={page.url}")
+                logger.info(f"SCREENSHOT | Login page detected after initial navigation, retrying profile navigation | user={user_id} | url={page.url}")
+
+            await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
+            await page.wait_for_load_state("domcontentloaded", timeout=60000)
+            await capture_page_summary(page, "profile_page_navigate", user_id)
+
+            if "discord.com/login" in page.url or page.url.endswith("/login"):
+                logger.warning(f"STORAGE_STATE_FAILED | login page still visible after profile navigation | user={user_id} | url={page.url}")
                 await capture_page_debug_state(page, "storage_state_login_failure", user_id)
                 await save_page_debug_screenshot(page, "storage_state_login_failure", user_id)
                 raise RuntimeError(f"Authentication failed after storage_state injection for user {user_id}")
