@@ -405,12 +405,25 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             log_step("SCREENSHOT", "Browser launched", user_id=user_id)
 
+            storage_state = {
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://discord.com",
+                        "localStorage": [
+                            {"name": "token", "value": USER_TOKEN}
+                        ]
+                    }
+                ]
+            }
+
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 device_scale_factor=2,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                storage_state=storage_state
             )
-            log_step("SCREENSHOT", "Browser context created", user_id=user_id)
+            log_step("SCREENSHOT", "Browser context created with storage_state", user_id=user_id)
 
             stealth_script = (
                 "() => {"
@@ -424,79 +437,26 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
             )
             await context.add_init_script(script=stealth_script)
 
-            token_script = (
-                f"(() => {{"
-                f"  try {{"
-                f"    const ls = window.localStorage;"
-                f"    if (!ls) return 'NO_LOCAL_STORAGE';"
-                f"    ls.setItem('token', {json.dumps(USER_TOKEN)});"
-                f"    return 'TOKEN_SET';"
-                f"  }} catch (e) {{"
-                f"    return `TOKEN_SCRIPT_ERROR:${{e.message}}`;"
-                f"  }}"
-                f"}})();"
-            )
-            await context.add_init_script(script=token_script)
-            log_step("SCREENSHOT", "Init scripts installed", user_id=user_id)
-
             page = await context.new_page()
-            await page.add_init_script(script=stealth_script)
-            await page.add_init_script(script=token_script)
-            log_step("SCREENSHOT", "Page created with init scripts", user_id=user_id)
+            log_step("SCREENSHOT", "Page created", user_id=user_id)
 
-            await page.goto("https://discord.com/login?redirect_to=%2Fchannels%2F%40me", wait_until="networkidle", timeout=60000)
+            await page.goto("https://discord.com/channels/@me", wait_until="networkidle", timeout=60000)
             await page.wait_for_load_state("domcontentloaded", timeout=60000)
             await capture_page_summary(page, "initial_navigate", user_id)
 
             if "discord.com/login" in page.url or page.url.endswith("/login"):
-                log_step("SCREENSHOT", "Login page still visible after navigation", user_id=user_id, page_url=page.url)
-                try:
-                    token_result = await page.evaluate(token_script)
-                    log_step("SCREENSHOT", "First token injection executed", user_id=user_id, token_result=token_result)
-                except Exception as eval_exc:
-                    log_exception("SCREENSHOT_EVAL", eval_exc, user_id=user_id)
+                logger.warning(f"STORAGE_STATE_FAILED | login page still visible after storage_state navigation | user={user_id} | url={page.url}")
+                await capture_page_debug_state(page, "storage_state_login_failure", user_id)
+                await save_page_debug_screenshot(page, "storage_state_login_failure", user_id)
+                raise RuntimeError(f"Authentication failed after storage_state injection for user {user_id}")
 
-                await asyncio.sleep(2)
-                await page.goto("https://discord.com/channels/@me", wait_until="networkidle", timeout=60000)
-                await page.wait_for_load_state("domcontentloaded", timeout=60000)
-                await capture_page_summary(page, "after_first_token_eval", user_id)
-
-            if "discord.com/login" in page.url or page.url.endswith("/login"):
-                log_step("SCREENSHOT", "Retrying token injection and reload", user_id=user_id, page_url=page.url)
-                try:
-                    token_result = await page.evaluate(token_script)
-                    log_step("SCREENSHOT", "Second token injection executed", user_id=user_id, token_result=token_result)
-                except Exception as eval_exc:
-                    log_exception("SCREENSHOT_EVAL_RETRY", eval_exc, user_id=user_id)
-
-                await asyncio.sleep(2)
-                await page.reload(wait_until="networkidle", timeout=60000)
-                await page.wait_for_load_state("domcontentloaded", timeout=60000)
-                await capture_page_summary(page, "after_reload", user_id)
-
-            if "discord.com/login" in page.url or page.url.endswith("/login"):
-                log_step("SCREENSHOT", "Navigating directly to target profile", user_id=user_id, target_url=f"https://discord.com/users/{user_id}")
-                await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
-                await page.wait_for_load_state("domcontentloaded", timeout=60000)
-                await capture_page_summary(page, "after_profile_navigation", user_id)
-
-            profile_selector = "div[class*='profile']"
             try:
-                await page.locator(profile_selector).first.wait_for(timeout=20000)
+                await page.locator("div[class*='profile']").first.wait_for(timeout=20000)
                 log_step("SCREENSHOT", "Profile area detected", user_id=user_id, page_url=page.url)
             except Exception as selector_exc:
                 logger.warning(f"Profile area not detected for {user_id}; may still be login or page changed | url={page.url}")
                 log_exception("SCREENSHOT_SELECTOR_TIMEOUT", selector_exc, user_id=user_id, page_url=page.url)
                 await capture_page_summary(page, "profile_selector_missing", user_id)
-
-            if "discord.com/login" in page.url or page.url.endswith("/login"):
-                page_dump = await page.content()
-                logger.error(
-                    f"SCREENSHOT_AUTH_FAILED | user={user_id} | url={page.url} | login page still visible | snippet={page_dump[:600].replace('\n', ' ')}"
-                )
-                await save_page_debug_screenshot(page, "final_login_failure", user_id)
-                await capture_page_debug_state(page, "final_login_failure", user_id)
-                raise RuntimeError(f"Authentication failed; still on login page for user {user_id}")
 
             screenshot = await page.screenshot(full_page=True)
             screenshot_length = len(screenshot)
