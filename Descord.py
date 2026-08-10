@@ -254,18 +254,43 @@ screenshot_queue = asyncio.Queue()
 
 # ==================== دوال جلب البيانات ====================
 async def fetch_user_data(user_id: str) -> dict | None:
-    url = f"{BASE_API}/users/{user_id}"
+    log_step("USER_FETCH", "Attempting to fetch user profile data", user_id=user_id)
+    endpoints = [
+        f"{BASE_API}/users/{user_id}/profile",
+        f"{BASE_API}/users/{user_id}"
+    ]
+
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, headers=HEADERS) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception as e:
-            logger.error(f"Error fetching user {user_id}: {e}")
+        for endpoint in endpoints:
+            try:
+                async with session.get(endpoint, headers=HEADERS) as resp:
+                    status = resp.status
+                    body = await resp.text()
+                    log_step("USER_FETCH", "Received profile response", user_id=user_id, endpoint=endpoint, status=status)
+                    if status == 200:
+                        payload = json.loads(body) if body else {}
+                        if endpoint.endswith("/profile"):
+                            payload = payload.get("user") or payload
+                        if isinstance(payload, dict):
+                            return {
+                                "id": str(payload.get("id") or user_id),
+                                "username": payload.get("username"),
+                                "global_name": payload.get("global_name"),
+                                "bio": payload.get("bio") or payload.get("about") or None,
+                                "avatar": payload.get("avatar") or None,
+                                "banner": payload.get("banner") or None,
+                                "clan": payload.get("clan") or None,
+                                "avatar_decoration_data": payload.get("avatar_decoration_data") or None,
+                            }
+                    else:
+                        log_step("USER_FETCH", "Profile request failed", user_id=user_id, endpoint=endpoint, status=status, response=body[:500])
+            except Exception as exc:
+                log_exception("fetch_user_data", exc, user_id=user_id, endpoint=endpoint)
     return None
 
 async def take_profile_screenshot(user_id: str) -> io.BytesIO:
     try:
+        log_step("SCREENSHOT", "Starting Playwright profile capture", user_id=user_id)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             context = await browser.new_context(
@@ -274,19 +299,21 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = await context.new_page()
-            await page.goto("https://discord.com/login", wait_until="networkidle")
-            await page.evaluate("(token) => window.localStorage.setItem('token', JSON.stringify(token))", USER_TOKEN)
-            await page.goto("https://discord.com/channels/@me", wait_until="networkidle")
-            await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle")
+
+            await page.goto(f"https://discord.com/users/{user_id}", wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=20000)
+
             try:
-                await page.wait_for_selector("div[class*='profile']", timeout=15000)
+                await page.locator("div[class*='profile']", has_text="").first.wait_for(timeout=15000)
             except Exception:
                 logger.warning(f"Profile screenshot selector timeout for user {user_id}")
+
             screenshot = await page.screenshot(full_page=True)
             await browser.close()
+            log_step("SCREENSHOT", "Playwright profile capture completed", user_id=user_id, size=len(screenshot))
             return io.BytesIO(screenshot)
     except Exception as e:
-        logger.error(f"Screenshot failed: {e}")
+        log_exception("take_profile_screenshot", e, user_id=user_id)
         return io.BytesIO(b'')
 
 async def schedule_offline_confirmation(user_id: str, started: datetime):
