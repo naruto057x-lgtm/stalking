@@ -41,14 +41,23 @@ MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://...")
 
 # ==================== نظام التسجيل ====================
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler("debug.log", mode='a')
     ]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("descord_selfbot")
+logger.setLevel(logging.DEBUG)
+
+
+def log_step(step: str, message: str, **details):
+    detail_text = " | ".join(f"{k}={v}" for k, v in details.items()) if details else ""
+    if detail_text:
+        logger.info("[DEBUG] %s | %s | %s", step, message, detail_text)
+    else:
+        logger.info("[DEBUG] %s | %s", step, message)
 
 # ==================== دوال الوقت ====================
 def get_egypt_time(dt: datetime = None) -> str:
@@ -93,37 +102,46 @@ async def human_delay():
 
 async def send_message(channel_id: int, embed: discord.Embed) -> int:
     """إرسال الرسالة المنسقة إلى القناة مع تأخير بشري"""
+    log_step("HTTP_SEND", "Preparing to send message", channel_id=channel_id, embed_title=getattr(embed, "title", None))
     await human_delay() # 👈 حماية ضد السبام
     url = f"{BASE_API}/channels/{channel_id}/messages"
     payload = {"content": embed_to_text(embed)}
+    log_step("HTTP_SEND", "Sending payload", channel_id=channel_id, payload_length=len(payload["content"]))
     
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=HEADERS, json=payload) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 logger.info(f"✅ Sent message to channel {channel_id}")
+                log_step("HTTP_SEND", "Message sent successfully", channel_id=channel_id, message_id=data.get("id"))
                 return int(data["id"])
             else:
                 text = await resp.text()
                 logger.error(f"❌ Failed to send message: {resp.status} {text}")
+                log_step("HTTP_SEND", "Message send failed", channel_id=channel_id, status=resp.status, response=text)
                 return 0
 
 async def edit_message(channel_id: int, message_id: int, embed: discord.Embed):
     """تعديل رسالة موجودة بنص جديد"""
+    log_step("HTTP_EDIT", "Preparing to edit message", channel_id=channel_id, message_id=message_id)
     await human_delay()
     url = f"{BASE_API}/channels/{channel_id}/messages/{message_id}"
     payload = {"content": embed_to_text(embed)}
+    log_step("HTTP_EDIT", "Editing payload", channel_id=channel_id, message_id=message_id, payload_length=len(payload["content"]))
     
     async with aiohttp.ClientSession() as session:
         async with session.patch(url, headers=HEADERS, json=payload) as resp:
             if resp.status == 200:
                 logger.info(f"✏️ Edited message {message_id}")
+                log_step("HTTP_EDIT", "Message edited successfully", channel_id=channel_id, message_id=message_id)
             else:
                 text = await resp.text()
                 logger.error(f"❌ Failed to edit message: {resp.status} {text}")
+                log_step("HTTP_EDIT", "Message edit failed", channel_id=channel_id, message_id=message_id, status=resp.status, response=text)
 
 async def send_message_with_file(channel_id: int, embed: discord.Embed, file_bytes: io.BytesIO, filename: str):
     """إرسال رسالة مع صورة (لقطة الشاشة)"""
+    log_step("HTTP_FILE", "Preparing to send file message", channel_id=channel_id, filename=filename, file_size=file_bytes.getbuffer().nbytes)
     await human_delay()
     url = f"{BASE_API}/channels/{channel_id}/messages"
     form = aiohttp.FormData()
@@ -131,14 +149,17 @@ async def send_message_with_file(channel_id: int, embed: discord.Embed, file_byt
     payload = {"content": embed_to_text(embed)}
     form.add_field("payload_json", json.dumps(payload), content_type="application/json")
     form.add_field("file", file_bytes.getvalue(), filename=filename, content_type="image/png")
+    log_step("HTTP_FILE", "Uploading file payload", channel_id=channel_id, filename=filename)
     
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers={"Authorization": USER_TOKEN}, data=form) as resp:
             if resp.status == 200:
                 logger.info("📸 Sent message with screenshot file")
+                log_step("HTTP_FILE", "File message sent successfully", channel_id=channel_id, filename=filename)
             else:
                 text = await resp.text()
                 logger.error(f"❌ Failed to send file: {resp.status} {text}")
+                log_step("HTTP_FILE", "File message send failed", channel_id=channel_id, filename=filename, status=resp.status, response=text)
 
 # ==================== إعداد البوت و MongoDB ====================
 try:
@@ -244,9 +265,22 @@ async def schedule_offline_confirmation(user_id: str, started: datetime):
     await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": end_time}}, upsert=True)
 
 # ==================== أحداث البوت الأساسية ====================
+@bot.before_invoke
+async def log_command_start(ctx):
+    log_step("COMMAND", "Command invocation started", command=ctx.command.name if ctx.command else "unknown", author=ctx.author.id if ctx.author else None, channel=ctx.channel.id if ctx.channel else None, content=ctx.message.content)
+
+@bot.after_invoke
+async def log_command_end(ctx):
+    log_step("COMMAND", "Command invocation completed", command=ctx.command.name if ctx.command else "unknown", author=ctx.author.id if ctx.author else None, channel=ctx.channel.id if ctx.channel else None)
+
+@bot.event
+async def on_command_error(ctx, error):
+    logger.exception("[COMMAND] Command raised an exception | command=%s | author=%s | channel=%s | error=%s", ctx.command.name if ctx.command else "unknown", ctx.author.id if ctx.author else None, ctx.channel.id if ctx.channel else None, error)
+
 @bot.event
 async def on_ready():
     logger.info(f"👤 Selfbot logged in as {bot.user}")
+    log_step("READY", "Bot is ready; sending startup notification", user=str(bot.user))
 
     embed = discord.Embed(
         title="⚡ Discord Monitor System Online",
@@ -255,15 +289,20 @@ async def on_ready():
     embed.set_footer(text="System Initialized")
     await send_message(COMMANDS_CHANNEL_ID, embed)
 
+    log_step("READY", "Starting background tasks", profile_loop=True, screenshot_worker=True)
     bot.loop.create_task(profile_check_loop())
     bot.loop.create_task(screenshot_worker())
 
 @bot.event
 async def on_message(message: discord.Message):
+    log_step("MESSAGE", "Received message event", author_id=message.author.id if message.author else None, channel_id=message.channel.id if message.channel else None, content=message.content)
     if message.author.id != bot.user.id:
+        log_step("MESSAGE", "Ignored message because author is not the selfbot", author_id=message.author.id if message.author else None)
         return
     if message.channel.id != COMMANDS_CHANNEL_ID:
+        log_step("MESSAGE", "Ignored message because channel is not the commands channel", channel_id=message.channel.id if message.channel else None, expected_channel_id=COMMANDS_CHANNEL_ID)
         return
+    log_step("MESSAGE", "Forwarding message to command processor", content=message.content)
     await bot.process_commands(message)
 
 # ==================== الأوامر ====================
@@ -519,17 +558,22 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
 async def profile_check_loop():
     """يفحص البروفايل بفترات عشوائية (حوالي دقيقة) لحماية الحساب من الحظر"""
     await bot.wait_until_ready()
+    log_step("PROFILE_LOOP", "Profile surveillance loop started")
     
     startup_embed = discord.Embed(title="🔄 Profile Surveillance Activated", description="Checking target profiles stealthily (~ every 60s).")
     await send_message(CHANGES_CHANNEL_ID, startup_embed)
     
     while not bot.is_closed():
         for uid in TARGET_USER_IDS:
+            log_step("PROFILE_LOOP", "Starting profile check cycle", user_id=uid)
             await asyncio.sleep(random.uniform(1.5, 3.5)) # 👈 تأخير بين فحص كل شخص والتاني
             
             data = await fetch_user_data(uid)
-            if not data: continue
+            if not data:
+                log_step("PROFILE_LOOP", "Profile fetch returned no data", user_id=uid)
+                continue
             
+            log_step("PROFILE_LOOP", "Profile data fetched", user_id=uid, username=data.get("username"))
             cached = await profile_cache_col.find_one({"_id": uid})
             new_cache = {
                 "username": data.get("username"),
@@ -551,38 +595,49 @@ async def profile_check_loop():
             if changes or not cached:
                 if not cached:
                     changes.append("*System cached the initial profile data successfully.*")
+                    log_step("PROFILE_LOOP", "No previous cache found; initial cache created", user_id=uid)
                     
                 await profile_cache_col.update_one({"_id": uid}, {"$set": new_cache}, upsert=True)
+                log_step("PROFILE_LOOP", "Profile cache updated", user_id=uid, changes_count=len(changes))
                 
                 embed = discord.Embed(
                     title="⚠️ Profile Update Detected", 
                     description=f"Changes found for <@{uid}>:\n\n" + "\n".join(changes)
                 )
                 embed.set_footer(text=f"Change recorded at {get_egypt_time()}")
+                log_step("PROFILE_LOOP", "Preparing profile change notification", user_id=uid, change_text="\n".join(changes))
                 
                 screenshot = await take_profile_screenshot(uid)
                 if screenshot.getbuffer().nbytes > 0:
+                    log_step("PROFILE_LOOP", "Sending profile screenshot notification", user_id=uid)
                     await send_message_with_file(CHANGES_CHANNEL_ID, embed, screenshot, f"update_{uid}.png")
                 else:
+                    log_step("PROFILE_LOOP", "Sending text-only profile notification", user_id=uid)
                     await send_message(CHANGES_CHANNEL_ID, embed)
                     
         # 👈 السر في الحماية: التكرار عشوائي بين 58 و 85 ثانية بدل 60 ثانية بالضبط
         cooldown = random.randint(58, 85)
+        log_step("PROFILE_LOOP", "Sleeping before next profile cycle", cooldown=cooldown)
         await asyncio.sleep(cooldown)
 
 async def screenshot_worker():
     """مدير طابور التقاط الشاشة للأوامر اليدوية"""
+    log_step("SCREENSHOT_WORKER", "Screenshot worker started")
     while True:
         ctx, user_id = await screenshot_queue.get()
+        log_step("SCREENSHOT_WORKER", "Processing screenshot request", user_id=user_id, channel_id=ctx.channel.id if ctx.channel else None)
         try:
             screenshot = await take_profile_screenshot(user_id)
             if screenshot.getbuffer().nbytes == 0:
+                log_step("SCREENSHOT_WORKER", "Screenshot capture returned empty bytes", user_id=user_id)
                 await ctx.send("❌ `Capture failed: Received empty image.`")
             else:
                 embed = discord.Embed(title="📸 Live Profile Capture")
                 embed.set_footer(text=f"Requested by User • {get_egypt_time()}")
+                log_step("SCREENSHOT_WORKER", "Sending captured screenshot", user_id=user_id)
                 await send_message_with_file(ctx.channel.id, embed, screenshot, f"capture_{user_id}.png")
         except Exception as e:
+            logger.exception("[SCREENSHOT_WORKER] Fatal error during capture | user_id=%s | error=%s", user_id, e)
             await ctx.send(f"❌ `Fatal error during capture: {str(e)}`")
         finally:
             screenshot_queue.task_done()
