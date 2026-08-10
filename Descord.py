@@ -141,8 +141,21 @@ async def send_message_with_file(channel_id: int, embed: discord.Embed, file_byt
                 logger.error(f"❌ Failed to send file: {resp.status} {text}")
 
 # ==================== إعداد البوت و MongoDB ====================
-# selfbot لا يحتاج intents، ونستخدم discord-py-self مباشرةً
-bot = commands.Bot(command_prefix="!", self_bot=True)
+try:
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.presences = True
+    intents.guilds = True
+    intents.members = True
+except AttributeError:
+    intents = None
+    logger.warning("discord.Intents is unavailable in this environment; continuing without explicit intents.")
+
+bot_kwargs = {"command_prefix": "!", "self_bot": True}
+if intents is not None:
+    bot_kwargs["intents"] = intents
+
+bot = commands.Bot(**bot_kwargs)
 bot.remove_command("help")
 
 try:
@@ -244,6 +257,14 @@ async def on_ready():
 
     bot.loop.create_task(profile_check_loop())
     bot.loop.create_task(screenshot_worker())
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.id != bot.user.id:
+        return
+    if message.channel.id != COMMANDS_CHANNEL_ID:
+        return
+    await bot.process_commands(message)
 
 # ==================== الأوامر ====================
 @bot.command(name="status")
