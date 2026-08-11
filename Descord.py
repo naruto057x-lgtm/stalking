@@ -221,7 +221,7 @@ async def send_message(channel_id: int, embed: discord.Embed) -> int:
         log_exception("send_message", exc, channel_id=channel_id)
         return 0
 
-async def edit_message(channel_id: int, message_id: int, embed: discord.Embed):
+async def edit_message(channel_id: int, message_id: int, embed: discord.Embed) -> bool:
     """تعديل رسالة موجودة بنص جديد"""
     log_step("HTTP_EDIT", "Preparing to edit existing message", channel_id=channel_id, message_id=message_id)
     try:
@@ -235,12 +235,15 @@ async def edit_message(channel_id: int, message_id: int, embed: discord.Embed):
                 if resp.status == 200:
                     logger.info(f"✏️ Edited message {message_id}")
                     log_step("HTTP_EDIT", "Message edited successfully", channel_id=channel_id, message_id=message_id)
+                    return True
                 else:
                     text = await resp.text()
                     logger.error(f"❌ Failed to edit message: {resp.status} {text}")
                     log_step("HTTP_EDIT", "Message edit failed", channel_id=channel_id, message_id=message_id, status=resp.status, response=text)
+                    return False
     except Exception as exc:
         log_exception("edit_message", exc, channel_id=channel_id, message_id=message_id)
+        return False
 
 async def send_message_with_file(channel_id: int, embed: discord.Embed, file_bytes: io.BytesIO, filename: str):
     """إرسال رسالة مع صورة (لقطة الشاشة)"""
@@ -357,6 +360,28 @@ current_status = {}
 pending_offline_tasks = {}
 screenshot_queue = asyncio.Queue()
 
+
+def get_status_label(status: discord.Status) -> str:
+    if status == discord.Status.online:
+        return "Online"
+    if status == discord.Status.idle:
+        return "Idle"
+    if status == discord.Status.dnd:
+        return "Do Not Disturb"
+    if status == discord.Status.offline:
+        return "Offline"
+    if status == discord.Status.invisible:
+        return "Invisible"
+    return str(status)
+
+
+def is_status_online(status: discord.Status) -> bool:
+    return status in {discord.Status.online, discord.Status.idle, discord.Status.dnd}
+
+
+def is_status_offline(status: discord.Status) -> bool:
+    return status in {discord.Status.offline, discord.Status.invisible}
+
 # ==================== دوال جلب البيانات ====================
 async def fetch_user_data(user_id: str) -> dict | None:
     log_step("USER_FETCH", "Attempting to fetch user profile data", user_id=user_id)
@@ -380,6 +405,8 @@ async def fetch_user_data(user_id: str) -> dict | None:
                             return {
                                 "id": str(payload.get("id") or user_id),
                                 "username": payload.get("username"),
+                                "discriminator": payload.get("discriminator"),
+                                "tag": f"{payload.get('username') or 'Unknown'}#{payload.get('discriminator') or '0000'}",
                                 "global_name": payload.get("global_name"),
                                 "bio": payload.get("bio") or payload.get("about") or None,
                                 "avatar": payload.get("avatar") or None,
@@ -518,7 +545,7 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
 
 async def schedule_offline_confirmation(user_id: str, started: datetime):
     await asyncio.sleep(600)
-    if current_status.get(user_id) != discord.Status.offline:
+    if not is_status_offline(current_status.get(user_id)):
         return
     online_data = active_online_msgs.get(user_id)
     if not online_data:
@@ -530,6 +557,7 @@ async def schedule_offline_confirmation(user_id: str, started: datetime):
         title="🔴 Session Confirmed Ended",
         description=f"<@{user_id}> remained offline for 10 minutes and the session has ended."
     )
+    embed.add_field(name="Previously Started As", value=online_data.get("status_label", "Online"), inline=False)
     embed.add_field(name="Session Started", value=get_egypt_time(started), inline=False)
     embed.add_field(name="Session Ended", value=get_egypt_time(end_time), inline=False)
     embed.add_field(name="Total Duration", value=f"⏱️ **{duration}**", inline=False)
@@ -539,7 +567,10 @@ async def schedule_offline_confirmation(user_id: str, started: datetime):
         embed.set_footer(text=f"{online_data['username']} • Last checked {get_egypt_time()}")
 
     if online_data.get("msg_id"):
-        await edit_message(ONLINE_CHANNEL_ID, online_data["msg_id"], embed)
+        edited = await edit_message(ONLINE_CHANNEL_ID, online_data["msg_id"], embed)
+        if not edited:
+            log_step("SCHEDULE_OFFLINE", "Offline session edit failed; sending fallback message", user_id=user_id, msg_id=online_data.get("msg_id"))
+            await send_message(ONLINE_CHANNEL_ID, embed)
     else:
         await send_message(ONLINE_CHANNEL_ID, embed)
 
@@ -876,11 +907,30 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     user_id = str(after.id)
     if user_id not in TARGET_USER_IDS: return
     now = datetime.now(timezone.utc)
-    current_status[user_id] = after.status
 
-    # 1. تتبع الأونلاين/أوفلاين
-    if before.status != after.status:
-        if after.status == discord.Status.online:
+    # Prefer server presence state from the monitored guild if the user is a member there.
+    server_member = None
+    guild = bot.get_guild(SERVER_ID)
+    if guild:
+        try:
+            server_member = guild.get_member(int(user_id))
+            if not server_member:
+                server_member = await guild.fetch_member(int(user_id))
+        except Exception as exc:
+            log_exception("FETCH_SERVER_MEMBER", exc, user_id=user_id, guild_id=SERVER_ID)
+
+    status_source = "server" if server_member else "gateway"
+    before_status = server_member.status if server_member else before.status
+    after_status = server_member.status if server_member else after.status
+    before_label = get_status_label(before_status)
+    after_label = get_status_label(after_status)
+
+    current_status[user_id] = after_status
+    log_step("PRESENCE_UPDATE", "Presence state changed", user_id=user_id, before=before_label, after=after_label, status_source=status_source)
+
+    # 1. تتبع الأونلاين/أوفلاين باستخدام حالة السيرفر إن كانت متاحة، وإظهار المصدر
+    if before_status != after_status:
+        if is_status_online(after_status):
             # cancel any pending offline confirmation
             if user_id in pending_offline_tasks:
                 try:
@@ -898,9 +948,14 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
                     log_exception("AVATAR_URL_RESOLVE", e, user_id=user_id)
                     avatar_url = None
 
+                source_text = "Server presence data" if status_source == "server" else "Public gateway data"
                 embed = discord.Embed(
-                    title="🟢 User is Online",
-                    description=f"<@{user_id}> has connected to Discord.\n\n🕒 **Started at:** {get_egypt_time(now)}"
+                    title=f"🟢 {get_status_label(after_status)} Session Started",
+                    description=(
+                        f"<@{user_id}> is now **{get_status_label(after_status)}** on Discord.\n"
+                        f"Source: **{source_text}**\n\n"
+                        f"🕒 **Started at:** {get_egypt_time(now)}"
+                    )
                 )
                 if avatar_url:
                     embed.set_thumbnail(url=avatar_url)
@@ -929,7 +984,8 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
                     "msg_id": msg_id or None,
                     "start_time": now,
                     "avatar_url": avatar_url,
-                    "username": after.display_name
+                    "username": after.display_name,
+                    "status_label": get_status_label(after_status)
                 }
                 try:
                     await online_msgs_col.update_one(
@@ -946,7 +1002,7 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
             except Exception as e:
                 log_exception("DB_UPDATE_LAST_ONLINE", e, user_id=user_id, last_online=now)
 
-        elif after.status == discord.Status.offline:
+        elif is_status_offline(after_status):
             online_data = active_online_msgs.get(user_id)
             if online_data:
                 if user_id in pending_offline_tasks:
@@ -956,17 +1012,30 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
                 pending_offline_tasks[user_id] = task
             else:
                 await last_seen_col.update_one({"_id": user_id}, {"$set": {"last_offline": now}}, upsert=True)
+        else:
+            log_step("PRESENCE_CHANGE", "Status change ignored for non-online/non-offline state", user_id=user_id, before=before_label, after=after_label)
+    activity_source = "server" if server_member else "gateway"
     before_acts = {act.name: act for act in before.activities if act.type != discord.ActivityType.custom}
-    after_acts = {act.name: act for act in after.activities if act.type != discord.ActivityType.custom}
+    if server_member:
+        after_acts = {act.name: act for act in server_member.activities if act.type != discord.ActivityType.custom}
+    else:
+        after_acts = {act.name: act for act in after.activities if act.type != discord.ActivityType.custom}
     
     started_acts = set(after_acts.keys()) - set(before_acts.keys())
     ended_acts = set(before_acts.keys()) - set(after_acts.keys())
 
     for name in started_acts:
         start = after_acts[name].start or now
+        source_text = "Server activity source" if activity_source == "server" else "Gateway activity source"
+        activity_desc = getattr(after_acts[name], 'details', None) or getattr(after_acts[name], 'state', None) or ''
         embed = discord.Embed(
             title="🎮 Activity Started",
-            description=f"<@{user_id}> started playing **{name}**\n\n🕒 **Since:** {get_egypt_time(start)}"
+            description=(
+                f"<@{user_id}> started **{name}**\n"
+                f"Source: **{source_text}**\n"
+                f"{(f'Activity Data: {activity_desc}\n' if activity_desc else '')}"
+                f"\n🕒 **Since:** {get_egypt_time(start)}"
+            )
         )
         msg_id = await send_message(ACTIVITY_CHANNEL_ID, embed)
         if msg_id:
@@ -1033,6 +1102,8 @@ async def profile_check_loop():
                 cached = await profile_cache_col.find_one({"_id": uid})
                 new_cache = {
                     "username": data.get("username"),
+                    "discriminator": data.get("discriminator"),
+                    "tag": data.get("tag"),
                     "global_name": data.get("global_name"),
                     "bio": data.get("bio"),
                     "avatar": data.get("avatar"),
