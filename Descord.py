@@ -92,6 +92,17 @@ UPLOAD_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9"
 }
 
+HTTP_TIMEOUT = 30
+PROFILE_LOOP_MIN_DELAY = 120
+PROFILE_LOOP_MAX_DELAY = 180
+PROFILE_PER_USER_DELAY_MIN = 4.0
+PROFILE_PER_USER_DELAY_MAX = 7.0
+SCREENSHOT_QUEUE_DELAY_MIN = 4.0
+SCREENSHOT_QUEUE_DELAY_MAX = 7.0
+SCREENSHOT_NAV_DELAY_MIN = 2.5
+SCREENSHOT_NAV_DELAY_MAX = 5.0
+AUTH_VALIDATION_ENDPOINT = f"{BASE_API}/users/@me"
+
 DEBUG_DUMP_DIR = os.getenv("DEBUG_DUMP_DIR", "debug_dumps")
 os.makedirs(DEBUG_DUMP_DIR, exist_ok=True)
 
@@ -191,9 +202,21 @@ def embed_to_text(embed: discord.Embed) -> str:
     return "\n".join(lines).strip()
 
 async def human_delay():
-    """محاكاة تأخير بشري قبل إرسال الرسائل (من 1.5 إلى 4 ثواني)"""
-    delay = random.uniform(1.5, 4.0)
+    """محاكاة تأخير بشري قبل إرسال الرسائل (من 2 إلى 5 ثواني)."""
+    delay = random.uniform(2.0, 5.0)
     await asyncio.sleep(delay)
+
+def build_headers() -> dict[str, str]:
+    return {
+        "Authorization": USER_TOKEN,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not A(Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "Windows"
+    }
 
 async def send_message(channel_id: int, embed: discord.Embed) -> int:
     """إرسال الرسالة المنسقة إلى القناة مع تأخير بشري"""
@@ -204,8 +227,8 @@ async def send_message(channel_id: int, embed: discord.Embed) -> int:
         payload = {"content": embed_to_text(embed)}
         log_step("HTTP_SEND", "Sending embed payload", channel_id=channel_id, payload_length=len(payload["content"]))
         
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=HEADERS, json=payload) as resp:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as session:
+            async with session.post(url, headers=build_headers(), json=payload) as resp:
                 if resp.status in (200, 201):
                     data = await resp.json()
                     message_id = int(data.get("id", 0) or 0)
@@ -230,8 +253,8 @@ async def edit_message(channel_id: int, message_id: int, embed: discord.Embed) -
         payload = {"content": embed_to_text(embed)}
         log_step("HTTP_EDIT", "Editing payload", channel_id=channel_id, message_id=message_id, payload_length=len(payload["content"]))
         
-        async with aiohttp.ClientSession() as session:
-            async with session.patch(url, headers=HEADERS, json=payload) as resp:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as session:
+            async with session.patch(url, headers=build_headers(), json=payload) as resp:
                 if resp.status == 200:
                     logger.info(f"✏️ Edited message {message_id}")
                     log_step("HTTP_EDIT", "Message edited successfully", channel_id=channel_id, message_id=message_id)
@@ -286,8 +309,8 @@ async def send_text_message(channel_id: int, text: str) -> int:
         await human_delay()
         url = f"{BASE_API}/channels/{channel_id}/messages"
         payload = {"content": text}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=HEADERS, json=payload) as resp:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as session:
+            async with session.post(url, headers=build_headers(), json=payload) as resp:
                 raw = await resp.text()
                 if resp.status in (200, 201):
                     try:
@@ -321,6 +344,20 @@ class SimpleCommandContext:
         if content is None:
             return
         await send_text_message(self.channel.id, str(content))
+
+async def check_token_status() -> bool:
+    """التأكد من أن التوكن صالح قبل بدء المهام الثقيلة."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as session:
+            async with session.get(AUTH_VALIDATION_ENDPOINT, headers=build_headers()) as resp:
+                if resp.status == 200:
+                    return True
+                body = await resp.text()
+                logger.critical(f"TOKEN_VALIDATION_FAILED | status={resp.status} | body={body[:300]}")
+                return False
+    except Exception as exc:
+        log_exception("check_token_status", exc)
+        return False
 
 # ==================== إعداد البوت و MongoDB ====================
 try:
@@ -496,26 +533,33 @@ async def take_profile_screenshot(user_id: str) -> io.BytesIO:
 
             page = await context.new_page()
             log_step("SCREENSHOT", "Page created", user_id=user_id)
+            await asyncio.sleep(random.uniform(SCREENSHOT_NAV_DELAY_MIN, SCREENSHOT_NAV_DELAY_MAX))
 
             await page.goto("https://discord.com/channels/@me", wait_until="networkidle", timeout=60000)
             await page.wait_for_load_state("domcontentloaded", timeout=60000)
+            await asyncio.sleep(random.uniform(2.5, 4.0))
             await capture_page_summary(page, "initial_navigate", user_id)
 
             if "discord.com/login" in page.url or page.url.endswith("/login"):
                 logger.info(f"SCREENSHOT | Login page detected after initial navigation, retrying profile navigation | user={user_id} | url={page.url}")
+                await asyncio.sleep(random.uniform(6.0, 9.0))
                 await page.evaluate(f"window.localStorage.setItem('token', {auth_token_json});")
+                await asyncio.sleep(random.uniform(1.5, 2.5))
                 await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
             else:
+                await asyncio.sleep(random.uniform(2.0, 3.5))
                 await page.goto(f"https://discord.com/users/{user_id}", wait_until="networkidle", timeout=60000)
 
             await page.wait_for_load_state("domcontentloaded", timeout=60000)
+            await asyncio.sleep(random.uniform(1.5, 2.5))
             await capture_page_summary(page, "profile_page_navigate", user_id)
 
             if "discord.com/login" in page.url or page.url.endswith("/login"):
                 logger.warning(f"STORAGE_STATE_FAILED | login page still visible after profile navigation | user={user_id} | url={page.url}")
                 await capture_page_debug_state(page, "storage_state_login_failure", user_id)
                 await save_page_debug_screenshot(page, "storage_state_login_failure", user_id)
-                raise RuntimeError(f"Authentication failed after storage_state injection for user {user_id}")
+                await browser.close()
+                return io.BytesIO(b'')
 
             try:
                 await page.locator("div[class*='profile']").first.wait_for(timeout=20000)
@@ -598,6 +642,12 @@ async def on_ready():
     log_step("READY", "Bot is ready; sending startup notification", user=str(bot.user))
 
     try:
+        valid_token = await check_token_status()
+        if not valid_token:
+            logger.critical("Invalid Discord token detected on startup; aborting to avoid further account risk.")
+            await bot.close()
+            return
+
         embed = discord.Embed(
             title="⚡ Discord Monitor System Online",
             description=f"**Selfbot:** {bot.user.mention}\nAll systems are fully operational with Anti-Ban active.\nUse `!help` in this channel for commands."
@@ -1080,10 +1130,11 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
 async def profile_check_loop():
     """يفحص البروفايل بفترات عشوائية (حوالي دقيقة) لحماية الحساب من الحظر"""
     await bot.wait_until_ready()
+    await asyncio.sleep(random.uniform(4.0, 8.0))
     log_step("PROFILE_LOOP", "Profile surveillance loop started")
     
     try:
-        startup_embed = discord.Embed(title="🔄 Profile Surveillance Activated", description="Checking target profiles stealthily (~ every 60s).")
+        startup_embed = discord.Embed(title="🔄 Profile Surveillance Activated", description="Checking target profiles stealthily (~ every 2-3 minutes).")
         await send_message(CHANGES_CHANNEL_ID, startup_embed)
     except Exception as exc:
         log_exception("profile_check_loop startup notification", exc)
@@ -1092,7 +1143,7 @@ async def profile_check_loop():
         for uid in TARGET_USER_IDS:
             log_step("PROFILE_LOOP", "Starting profile check cycle", user_id=uid)
             try:
-                await asyncio.sleep(random.uniform(1.5, 3.5))
+                await asyncio.sleep(random.uniform(PROFILE_PER_USER_DELAY_MIN, PROFILE_PER_USER_DELAY_MAX))
                 data = await fetch_user_data(uid)
                 if not data:
                     log_step("PROFILE_LOOP", "Profile fetch returned no data", user_id=uid)
@@ -1143,8 +1194,8 @@ async def profile_check_loop():
                         await send_message(CHANGES_CHANNEL_ID, embed)
             except Exception as exc:
                 log_exception("profile_check_loop cycle", exc, user_id=uid)
-                
-        cooldown = random.randint(58, 85)
+
+        cooldown = random.randint(PROFILE_LOOP_MIN_DELAY, PROFILE_LOOP_MAX_DELAY)
         log_step("PROFILE_LOOP", "Sleeping before next profile cycle", cooldown=cooldown)
         await asyncio.sleep(cooldown)
 
@@ -1153,6 +1204,7 @@ async def screenshot_worker():
     log_step("SCREENSHOT_WORKER", "Screenshot worker started")
     while True:
         ctx, user_id = await screenshot_queue.get()
+        await asyncio.sleep(random.uniform(SCREENSHOT_QUEUE_DELAY_MIN, SCREENSHOT_QUEUE_DELAY_MAX))
         queue_size = screenshot_queue.qsize()
         log_step("SCREENSHOT_WORKER", "Processing screenshot request", user_id=user_id, channel_id=ctx.channel.id if ctx.channel else None, queue_size=queue_size)
         try:
