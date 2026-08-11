@@ -78,7 +78,7 @@ def get_egypt_time(dt: datetime = None) -> str:
 
 # ==================== دوال HTTP مع التصميم الاحترافي ====================
 BASE_API = "https://discord.com/api/v10"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 HEADERS = {
     "Authorization": USER_TOKEN,
     "Content-Type": "application/json",
@@ -93,14 +93,14 @@ UPLOAD_HEADERS = {
 }
 
 HTTP_TIMEOUT = 30
-PROFILE_LOOP_MIN_DELAY = 120
-PROFILE_LOOP_MAX_DELAY = 180
-PROFILE_PER_USER_DELAY_MIN = 4.0
-PROFILE_PER_USER_DELAY_MAX = 7.0
-SCREENSHOT_QUEUE_DELAY_MIN = 4.0
-SCREENSHOT_QUEUE_DELAY_MAX = 7.0
-SCREENSHOT_NAV_DELAY_MIN = 2.5
-SCREENSHOT_NAV_DELAY_MAX = 5.0
+PROFILE_LOOP_MIN_DELAY = 40
+PROFILE_LOOP_MAX_DELAY = 70
+PROFILE_PER_USER_DELAY_MIN = 8.0
+PROFILE_PER_USER_DELAY_MAX = 12.0
+SCREENSHOT_QUEUE_DELAY_MIN = 8.0
+SCREENSHOT_QUEUE_DELAY_MAX = 12.0
+SCREENSHOT_NAV_DELAY_MIN = 3.5
+SCREENSHOT_NAV_DELAY_MAX = 6.0
 AUTH_VALIDATION_ENDPOINT = f"{BASE_API}/users/@me"
 
 DEBUG_DUMP_DIR = os.getenv("DEBUG_DUMP_DIR", "debug_dumps")
@@ -427,10 +427,10 @@ async def fetch_user_data(user_id: str) -> dict | None:
         f"{BASE_API}/users/{user_id}"
     ]
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as session:
         for endpoint in endpoints:
             try:
-                async with session.get(endpoint, headers=HEADERS) as resp:
+                async with session.get(endpoint, headers=build_headers()) as resp:
                     status = resp.status
                     body = await resp.text()
                     log_step("USER_FETCH", "Received profile response", user_id=user_id, endpoint=endpoint, status=status)
@@ -1224,9 +1224,17 @@ async def screenshot_worker():
             screenshot_queue.task_done()
 
 # ==================== التشغيل ====================
+async def validate_token_before_start() -> bool:
+    valid = await check_token_status()
+    if not valid:
+        logger.critical("Invalid Discord token detected before startup; aborting to avoid additional account risk.")
+    return valid
+
 if __name__ == "__main__":
     try:
+        if not asyncio.run(validate_token_before_start()):
+            sys.exit(1)
         # لو بتستخدم مكتبة discord.py-self، شغّل مباشرةً بالتوكن فقط
-        bot.run(USER_TOKEN)
+        bot.run(USER_TOKEN, reconnect=False)
     except Exception as e:
         logger.critical(f"Fatal error: {e}\n{traceback.format_exc()}")
